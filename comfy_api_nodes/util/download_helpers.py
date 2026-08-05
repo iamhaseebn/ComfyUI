@@ -27,6 +27,7 @@ from .common_exceptions import ApiServerError, LocalNetworkError, ProcessingInte
 from .conversions import audio_bytes_to_audio_input, bytesio_to_image_tensor
 
 _RETRY_STATUS = {408, 429, 500, 502, 503, 504}
+_MAX_IN_MEMORY_DOWNLOAD_BYTES = 512 * 1024 * 1024
 
 
 async def download_url_to_bytesio(
@@ -58,6 +59,8 @@ async def download_url_to_bytesio(
     attempt = 0
     delay = retry_delay
     headers: dict[str, str] = {}
+    is_path_sink = isinstance(dest, (str, Path))
+    can_reset_sink = is_path_sink or (callable(getattr(dest, "seek", None)) and callable(getattr(dest, "truncate", None)))
 
     parsed_url = urlparse(url)
     if not parsed_url.scheme and not parsed_url.netloc:  # is URL relative?
@@ -68,10 +71,12 @@ async def download_url_to_bytesio(
 
     while True:
         attempt += 1
+        if not is_path_sink and can_reset_sink:
+            dest.seek(0)
+            dest.truncate(0)
         op_id = _generate_operation_id("GET", url, attempt)
         timeout_cfg = aiohttp.ClientTimeout(total=timeout)
 
-        is_path_sink = isinstance(dest, (str, Path))
         fhandle = None
         session: aiohttp.ClientSession | None = None
         stop_evt: asyncio.Event | None = None
@@ -129,10 +134,16 @@ async def download_url_to_bytesio(
                         )
 
                     if resp.status in _RETRY_STATUS and attempt <= max_retries:
+                        if not can_reset_sink:
+                            raise Exception(f"Failed to download (HTTP {resp.status}); destination cannot be reset for retry.")
                         await sleep_with_interrupt(delay, cls, None, None, None)
                         delay *= retry_backoff
                         continue
                     raise Exception(f"Failed to download (HTTP {resp.status}).")
+
+                max_bytes = None if is_path_sink else _MAX_IN_MEMORY_DOWNLOAD_BYTES
+                if max_bytes is not None and resp.content_length is not None and resp.content_length > max_bytes:
+                    raise ValueError(f"Download exceeds the {max_bytes}-byte in-memory limit.")
 
                 if is_path_sink:
                     p = Path(str(dest))
@@ -160,10 +171,12 @@ async def download_url_to_bytesio(
                             break
                         continue
 
-                    sink.write(chunk)
                     written += len(chunk)
+                    if max_bytes is not None and written > max_bytes:
+                        raise ValueError(f"Download exceeds the {max_bytes}-byte in-memory limit.")
+                    sink.write(chunk)
 
-                if isinstance(dest, BytesIO):
+                if not is_path_sink and hasattr(dest, "seek"):
                     with contextlib.suppress(Exception):
                         dest.seek(0)
 
@@ -180,6 +193,8 @@ async def download_url_to_bytesio(
             raise ProcessingInterrupted("Task cancelled") from None
         except (ClientError, OSError) as e:
             if attempt <= max_retries:
+                if not can_reset_sink:
+                    raise ApiServerError("The download failed and its destination cannot be reset for retry.") from e
                 request_logger.log_request_response(
                     operation_id=op_id,
                     request_method="GET",

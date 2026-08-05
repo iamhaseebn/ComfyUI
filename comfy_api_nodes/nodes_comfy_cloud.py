@@ -1,4 +1,7 @@
+import math
+import re
 from typing import ClassVar
+from urllib.parse import quote
 
 from typing_extensions import override
 
@@ -29,6 +32,11 @@ from comfy_api_nodes.util import (
 
 
 _GENERATE_ENDPOINT = ApiEndpoint(path="/proxy/comfy-cloud/workflow/generate", method="POST")
+
+
+def _task_endpoints(task_id: str) -> tuple[ApiEndpoint, ApiEndpoint]:
+    task_path = f"/proxy/comfy-cloud/workflow/tasks/{quote(task_id, safe='')}"
+    return ApiEndpoint(path=task_path), ApiEndpoint(path=f"{task_path}/cancel", method="POST")
 
 
 class _ComfyCloudWorkflowNode(IO.ComfyNode):
@@ -69,7 +77,8 @@ class _ComfyCloudWorkflowNode(IO.ComfyNode):
 
     @classmethod
     async def execute(cls, prompt: str, image: Input.Image | None = None) -> IO.NodeOutput:
-        validate_string(prompt, min_length=1)
+        prompt = prompt.strip()
+        validate_string(prompt, min_length=1, max_length=4096)
 
         image_url = None
         if cls.requires_image:
@@ -94,17 +103,17 @@ class _ComfyCloudWorkflowNode(IO.ComfyNode):
                 inputs=inputs,
             ),
         )
+        polling_endpoint, cancel_endpoint = _task_endpoints(task.task_id)
         result = await poll_op(
             cls,
-            ApiEndpoint(path=task.polling_url),
+            polling_endpoint,
             response_model=ComfyCloudStatusResponse,
             status_extractor=lambda response: response.status,
             progress_extractor=lambda response: response.progress,
-            cancel_endpoint=ApiEndpoint(path=task.cancel_url, method="POST"),
+            cancel_endpoint=cancel_endpoint,
         )
         if not result.output_url:
-            detail = f": {result.error}" if result.error else ""
-            raise RuntimeError(f"Comfy Cloud task {result.task_id} completed without an output URL{detail}")
+            raise RuntimeError("Comfy Cloud task completed without an output URL.")
 
         if cls.returns_video:
             output = await download_url_to_video_output(result.output_url, cls=cls)
@@ -406,17 +415,17 @@ class ComfyCloudSeedVR2ImageUpscaleNode(_ComfyCloudWorkflowNode):
 
 async def _run_video_workflow(cls: type[IO.ComfyNode], workflow: ComfyCloudWorkflow, inputs: ComfyCloudWorkflowInputs) -> IO.NodeOutput:
     task = await sync_op(cls, _GENERATE_ENDPOINT, response_model=ComfyCloudGenerateResponse, data=ComfyCloudGenerateRequest(workflow=workflow, inputs=inputs))
+    polling_endpoint, cancel_endpoint = _task_endpoints(task.task_id)
     result = await poll_op(
         cls,
-        ApiEndpoint(path=task.polling_url),
+        polling_endpoint,
         response_model=ComfyCloudStatusResponse,
         status_extractor=lambda response: response.status,
         progress_extractor=lambda response: response.progress,
-        cancel_endpoint=ApiEndpoint(path=task.cancel_url, method="POST"),
+        cancel_endpoint=cancel_endpoint,
     )
     if not result.output_url:
-        detail = f": {result.error}" if result.error else ""
-        raise RuntimeError(f"Comfy Cloud task {result.task_id} completed without an output URL{detail}")
+        raise RuntimeError("Comfy Cloud task completed without an output URL.")
     return IO.NodeOutput(await download_url_to_video_output(result.output_url, cls=cls))
 
 
@@ -499,8 +508,8 @@ class ComfyCloudLTX23ImageAudioPerformanceNode(IO.ComfyNode):
         validate_string(prompt, min_length=1, max_length=4096)
         if get_number_of_images(image) != 1:
             raise ValueError("Exactly one input image is required.")
-        audio_duration = audio["waveform"].shape[-1] / audio["sample_rate"]
-        if duration_seconds > audio_duration:
+        audio_duration = _audio_duration(audio)
+        if duration_seconds - min(1 / float(audio["sample_rate"]), 1e-3) > audio_duration:
             raise ValueError(f"Duration ({duration_seconds:g}s) exceeds input audio duration ({audio_duration:.2f}s).")
         image_url = await upload_image_to_comfyapi(cls, image)
         audio_url = await upload_audio_to_comfyapi(cls, audio)
@@ -552,17 +561,17 @@ class ComfyCloudSCAIL2CharacterReplacementNode(IO.ComfyNode):
         return _video_schema(
             "ComfyCloudSCAIL2CharacterReplacementNode",
             "SCAIL-2 Character Replacement",
-            [IO.Image.Input("reference_character"), IO.Video.Input("driving_video", tooltip="Must contain 81–157 decoded frames."), _prompt_input("scene_prompt"), IO.String.Input("driving_subject", default=""), IO.String.Input("reference_subject", default="human"), _video_seed_input(1)],
+            [IO.Image.Input("reference_character"), IO.Video.Input("driving_video", tooltip="Must contain 81–157 decoded frames."), _prompt_input("scene_prompt"), IO.String.Input("driving_subject", default="human"), IO.String.Input("reference_subject", default="human"), _video_seed_input(1)],
         )
 
     @classmethod
     async def execute(cls, reference_character: Input.Image, driving_video: Input.Video, scene_prompt: str, driving_subject: str, reference_subject: str, seed: int) -> IO.NodeOutput:
-        validate_string(scene_prompt, min_length=1, max_length=4096)
-        validate_string(driving_subject, min_length=1, max_length=256)
-        validate_string(reference_subject, min_length=1, max_length=256)
+        validate_string(scene_prompt, min_length=1, max_length=4096, field_name="scene_prompt")
+        validate_string(driving_subject, min_length=1, max_length=256, field_name="driving_subject")
+        validate_string(reference_subject, min_length=1, max_length=256, field_name="reference_subject")
         if get_number_of_images(reference_character) != 1:
             raise ValueError("Exactly one reference character image is required.")
-        validate_video_frame_count(driving_video, min_frame_count=81, max_frame_count=157)
+        validate_video_frame_count(driving_video, min_frame_count=81, max_frame_count=157, fail_on_error=True)
         image_url = await upload_image_to_comfyapi(cls, reference_character)
         video_url = await upload_video_to_comfyapi(cls, driving_video)
         return await _run_video_workflow(cls, "video.scail-2-character-replacement.v1", ComfyCloudWorkflowInputs(scene_prompt=scene_prompt, driving_subject=driving_subject, reference_subject=reference_subject, reference_character_url=image_url, driving_video_url=video_url, seed=seed))
@@ -587,13 +596,44 @@ def _audio_schema(node_id: str, display_name: str, inputs: list[IO.Input], outpu
 
 
 def _audio_duration(audio: Input.Audio) -> float:
-    return audio["waveform"].shape[-1] / audio["sample_rate"]
+    sample_rate = float(audio["sample_rate"])
+    if not math.isfinite(sample_rate) or sample_rate <= 0:
+        raise ValueError("Audio sample rate must be a positive number.")
+    return audio["waveform"].shape[-1] / sample_rate
 
 
 def _validate_audio_duration(name: str, audio: Input.Audio, minimum: float, maximum: float) -> None:
     duration = _audio_duration(audio)
-    if duration < minimum or duration > maximum:
+    tolerance = min(1 / float(audio["sample_rate"]), 1e-3)
+    if duration + tolerance < minimum or duration - tolerance > maximum:
         raise ValueError(f"{name} duration must be between {minimum:g} and {maximum:g} seconds.")
+
+
+def _normalize_dialogue(script: str) -> str:
+    utterances: list[tuple[str, list[str]]] = []
+    for raw_line in script.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        match = re.fullmatch(r"(?:SPEAKER\s+)?([A-Z])\s*:\s*(.*)", line, flags=re.IGNORECASE)
+        if match:
+            speaker, text = match.groups()
+            if speaker.upper() not in ("A", "B"):
+                raise ValueError("Dialogue supports only speakers A and B.")
+            if utterances and not utterances[-1][1]:
+                raise ValueError("Dialogue utterances cannot be blank.")
+            utterances.append((speaker.upper(), [text.strip()] if text.strip() else []))
+        elif re.match(r"(?:SPEAKER\s+[A-Z]|NARRATOR)\s*:", line, flags=re.IGNORECASE):
+            raise ValueError("Dialogue supports only speakers A and B.")
+        elif utterances:
+            utterances[-1][1].append(line)
+        else:
+            raise ValueError("Dialogue must start with speaker A or B.")
+    if not utterances:
+        raise ValueError("Dialogue must contain at least one utterance.")
+    if not utterances[-1][1]:
+        raise ValueError("Dialogue utterances cannot be blank.")
+    return "\n".join(f"SPEAKER {speaker}: {' '.join(lines)}" for speaker, lines in utterances)
 
 
 async def _audio_asset(cls: type[IO.ComfyNode], name: str, audio: Input.Audio) -> dict[str, ComfyCloudAssetInput]:
@@ -602,23 +642,22 @@ async def _audio_asset(cls: type[IO.ComfyNode], name: str, audio: Input.Audio) -
 
 async def _run_audio_workflow(cls: type[IO.ComfyNode], workflow: ComfyCloudWorkflow, inputs: ComfyCloudWorkflowInputs, output_names: tuple[str, ...] = ()) -> IO.NodeOutput:
     task = await sync_op(cls, _GENERATE_ENDPOINT, response_model=ComfyCloudGenerateResponse, data=ComfyCloudGenerateRequest(workflow=workflow, inputs=inputs))
+    polling_endpoint, cancel_endpoint = _task_endpoints(task.task_id)
     result = await poll_op(
         cls,
-        ApiEndpoint(path=task.polling_url),
+        polling_endpoint,
         response_model=ComfyCloudStatusResponse,
         status_extractor=lambda response: response.status,
         progress_extractor=lambda response: response.progress,
-        cancel_endpoint=ApiEndpoint(path=task.cancel_url, method="POST"),
+        cancel_endpoint=cancel_endpoint,
     )
     if output_names:
         if not result.output_urls or any(not result.output_urls.get(name) for name in output_names):
-            detail = f": {result.error}" if result.error else ""
-            raise RuntimeError(f"Comfy Cloud task {result.task_id} completed without all named output URLs{detail}")
+            raise RuntimeError("Comfy Cloud task completed without all named output URLs.")
         outputs = [await download_url_to_audio_input(result.output_urls[name], cls=cls) for name in output_names]
         return IO.NodeOutput(*outputs)
     if not result.output_url:
-        detail = f": {result.error}" if result.error else ""
-        raise RuntimeError(f"Comfy Cloud task {result.task_id} completed without an output URL{detail}")
+        raise RuntimeError("Comfy Cloud task completed without an output URL.")
     return IO.NodeOutput(await download_url_to_audio_input(result.output_url, cls=cls))
 
 
@@ -709,8 +748,8 @@ class ComfyCloudChatterboxDialogueNode(IO.ComfyNode):
     @classmethod
     async def execute(cls, script: str, speaker_a_reference: Input.Audio, speaker_b_reference: Input.Audio, exaggeration: float, cfg_weight: float, temperature: float, seed: int) -> IO.NodeOutput:
         validate_string(script, min_length=1, max_length=10000, field_name="script")
-        if any(line.strip() and not line.strip().startswith(("SPEAKER A:", "SPEAKER B:", "SPEAKER C:", "SPEAKER D:")) for line in script.splitlines()):
-            raise ValueError("Every nonblank utterance must start with SPEAKER A: through SPEAKER D:.")
+        script = _normalize_dialogue(script)
+        validate_string(script, min_length=1, max_length=10000, field_name="script")
         _validate_audio_duration("Speaker A reference", speaker_a_reference, 1, 30)
         _validate_audio_duration("Speaker B reference", speaker_b_reference, 1, 30)
         assets = {
@@ -758,17 +797,17 @@ class ComfyCloudMelBandRoFormerStemSeparationNode(IO.ComfyNode):
 
 async def _run_3d_workflow(cls: type[IO.ComfyNode], workflow: ComfyCloudWorkflow, inputs: ComfyCloudWorkflowInputs, file_format: str) -> IO.NodeOutput:
     task = await sync_op(cls, _GENERATE_ENDPOINT, response_model=ComfyCloudGenerateResponse, data=ComfyCloudGenerateRequest(workflow=workflow, inputs=inputs))
+    polling_endpoint, cancel_endpoint = _task_endpoints(task.task_id)
     result = await poll_op(
         cls,
-        ApiEndpoint(path=task.polling_url),
+        polling_endpoint,
         response_model=ComfyCloudStatusResponse,
         status_extractor=lambda response: response.status,
         progress_extractor=lambda response: response.progress,
-        cancel_endpoint=ApiEndpoint(path=task.cancel_url, method="POST"),
+        cancel_endpoint=cancel_endpoint,
     )
     if not result.output_url:
-        detail = f": {result.error}" if result.error else ""
-        raise RuntimeError(f"Comfy Cloud task {result.task_id} completed without an output URL{detail}")
+        raise RuntimeError("Comfy Cloud task completed without an output URL.")
     return IO.NodeOutput(await download_url_to_file_3d(result.output_url, file_format, cls=cls))
 
 
@@ -840,6 +879,8 @@ class ComfyCloudHunyuan3DMultiViewTo3DNode(IO.ComfyNode):
 
     @classmethod
     async def execute(cls, front_image: Input.Image, back_image: Input.Image, seed: int) -> IO.NodeOutput:
+        if get_number_of_images(front_image) != 1 or get_number_of_images(back_image) != 1:
+            raise ValueError("Exactly one front image and one back image are required.")
         assets = await _image_asset(cls, "front_image", front_image, "Uploading front image")
         assets.update(await _image_asset(cls, "back_image", back_image, "Uploading back image"))
         return await _run_3d_workflow(cls, "3d.hunyuan3d-multiview-to-3d.v1", ComfyCloudWorkflowInputs(assets=assets, seed=seed), "glb")

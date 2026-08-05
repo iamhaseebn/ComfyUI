@@ -138,11 +138,14 @@ def validate_video_frame_count(
     video: Input.Video,
     min_frame_count: int | None = None,
     max_frame_count: int | None = None,
+    fail_on_error: bool = False,
 ):
     try:
         frame_count = video.get_frame_count()
     except Exception as e:
         logging.error("Error getting frame count of video: %s", e)
+        if fail_on_error:
+            raise ValueError("Unable to determine video frame count.") from e
         return
 
     if min_frame_count is not None and min_frame_count > frame_count:

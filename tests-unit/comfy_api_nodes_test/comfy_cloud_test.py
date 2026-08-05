@@ -3,6 +3,7 @@ from io import BytesIO
 from typing import get_args
 from unittest.mock import AsyncMock, Mock
 
+import aiohttp
 import pytest
 import torch
 
@@ -108,6 +109,61 @@ def test_contract_omits_optional_status_fields():
         "inputs": {"prompt": "A lighthouse"},
     }
     assert status.model_dump(exclude_none=True) == {"task_id": "task-1", "status": "queued"}
+
+
+@pytest.mark.parametrize(
+    "node",
+    [
+        nodes_comfy_cloud.ComfyCloudTextToImageNode,
+        nodes_comfy_cloud.ComfyCloudTextToVideoNode,
+        nodes_comfy_cloud.ComfyCloudImageToVideoNode,
+        nodes_comfy_cloud.ComfyCloudImageEditNode,
+    ],
+)
+def test_legacy_nodes_reject_oversized_prompts(monkeypatch, node):
+    sync = AsyncMock()
+    monkeypatch.setattr(nodes_comfy_cloud, "sync_op", sync)
+
+    with pytest.raises(Exception, match="4096"):
+        asyncio.run(node.execute("x" * 4097, object()))
+    sync.assert_not_awaited()
+
+
+def test_legacy_nodes_strip_prompts_before_submission(monkeypatch):
+    run = AsyncMock(return_value=("output",))
+    monkeypatch.setattr(nodes_comfy_cloud.ComfyCloudTextToImageNode, "_run", run)
+
+    asyncio.run(nodes_comfy_cloud.ComfyCloudTextToImageNode.execute("  prompt  "))
+
+    assert run.call_args.args[0].prompt == "prompt"
+
+
+def test_task_routes_ignore_response_urls_and_errors_hide_task_token(monkeypatch):
+    sync = AsyncMock(
+        return_value=ComfyCloudGenerateResponse(
+            task_id="secret/task-token",
+            status="queued",
+            polling_url="https://attacker.example/poll",
+            cancel_url="https://attacker.example/cancel",
+        )
+    )
+    poll = AsyncMock(
+        return_value=ComfyCloudStatusResponse(
+            task_id="secret/task-token",
+            status="completed",
+            error="provider details with secret/task-token",
+        )
+    )
+    monkeypatch.setattr(nodes_comfy_cloud, "sync_op", sync)
+    monkeypatch.setattr(nodes_comfy_cloud, "poll_op", poll)
+
+    with pytest.raises(RuntimeError) as error:
+        asyncio.run(nodes_comfy_cloud.ComfyCloudTextToVideoNode.execute("A prompt"))
+
+    assert poll.call_args.args[1].path == "/proxy/comfy-cloud/workflow/tasks/secret%2Ftask-token"
+    assert poll.call_args.kwargs["cancel_endpoint"].path == "/proxy/comfy-cloud/workflow/tasks/secret%2Ftask-token/cancel"
+    assert "task-token" not in str(error.value)
+    assert "provider details" not in str(error.value)
 
 
 IMAGE_POC_NODES = [
@@ -302,6 +358,157 @@ def test_scail_stages_reference_image_and_driving_video(monkeypatch):
     video.get_frame_count.assert_called_once()
 
 
+def test_scail_defaults_and_frame_count_fail_closed_before_upload(monkeypatch):
+    schema = {input.id: input for input in nodes_comfy_cloud.ComfyCloudSCAIL2CharacterReplacementNode.define_schema().inputs}
+    image_upload = AsyncMock()
+    video_upload = AsyncMock()
+    video = Mock()
+    video.get_frame_count.side_effect = RuntimeError("decode failed")
+    monkeypatch.setattr(nodes_comfy_cloud, "upload_image_to_comfyapi", image_upload)
+    monkeypatch.setattr(nodes_comfy_cloud, "upload_video_to_comfyapi", video_upload)
+    monkeypatch.setattr(nodes_comfy_cloud, "get_number_of_images", lambda image: 1)
+
+    assert schema["driving_subject"].default == "human"
+    with pytest.raises(ValueError, match="Unable to determine video frame count"):
+        asyncio.run(nodes_comfy_cloud.ComfyCloudSCAIL2CharacterReplacementNode.execute(object(), video, "park", "human", "human", 1))
+    image_upload.assert_not_awaited()
+    video_upload.assert_not_awaited()
+
+
+@pytest.mark.parametrize("frame_count", [80, 158])
+def test_scail_rejects_out_of_range_frames_before_upload(monkeypatch, frame_count):
+    upload = AsyncMock()
+    video = Mock()
+    video.get_frame_count.return_value = frame_count
+    monkeypatch.setattr(nodes_comfy_cloud, "upload_image_to_comfyapi", upload)
+    monkeypatch.setattr(nodes_comfy_cloud, "upload_video_to_comfyapi", upload)
+    monkeypatch.setattr(nodes_comfy_cloud, "get_number_of_images", lambda image: 1)
+
+    with pytest.raises(ValueError, match="frame count"):
+        asyncio.run(nodes_comfy_cloud.ComfyCloudSCAIL2CharacterReplacementNode.execute(object(), video, "park", "human", "human", 1))
+    upload.assert_not_awaited()
+
+
+def test_in_memory_download_resets_retry_and_enforces_stream_limit(monkeypatch):
+    class Content:
+        def __init__(self, chunks):
+            self.chunks = iter(chunks)
+            self.finished = False
+
+        async def read(self, size):
+            chunk = next(self.chunks)
+            if isinstance(chunk, Exception):
+                raise chunk
+            if not chunk:
+                self.finished = True
+            return chunk
+
+        def at_eof(self):
+            return self.finished
+
+    class Response:
+        status = 200
+        headers = {}
+
+        def __init__(self, chunks, content_length=None):
+            self.content = Content(chunks)
+            self.content_length = content_length
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+    responses = [Response([b"partial", aiohttp.ClientPayloadError("retry")]), Response([b"final", b""])]
+
+    class Session:
+        def __init__(self, timeout):
+            pass
+
+        async def get(self, url, headers):
+            return responses.pop(0)
+
+        async def close(self):
+            pass
+
+    monkeypatch.setattr(download_helpers.aiohttp, "ClientSession", Session)
+    monkeypatch.setattr(download_helpers, "sleep_with_interrupt", AsyncMock())
+    destination = BytesIO()
+
+    asyncio.run(download_helpers.download_url_to_bytesio("https://example.com/result", destination))
+    assert destination.read() == b"final"
+
+    monkeypatch.setattr(download_helpers, "_MAX_IN_MEMORY_DOWNLOAD_BYTES", 4)
+    responses.append(Response([b"12345", b""]))
+    with pytest.raises(ValueError, match="in-memory limit"):
+        asyncio.run(download_helpers.download_url_to_bytesio("https://example.com/result", BytesIO()))
+
+    responses.append(Response([], content_length=5))
+    with pytest.raises(ValueError, match="in-memory limit"):
+        asyncio.run(download_helpers.download_url_to_bytesio("https://example.com/result", BytesIO()))
+
+
+def test_file_object_download_resets_retry_and_enforces_stream_limit(monkeypatch, tmp_path):
+    destination = (tmp_path / "result.bin").open("w+b")
+    destination.write(b"stale")
+
+    class Content:
+        def __init__(self, chunks):
+            self.chunks = iter(chunks)
+            self.finished = False
+
+        async def read(self, size):
+            chunk = next(self.chunks)
+            if isinstance(chunk, Exception):
+                raise chunk
+            if not chunk:
+                self.finished = True
+            return chunk
+
+        def at_eof(self):
+            return self.finished
+
+    class Response:
+        status = 200
+        headers = {}
+        content_length = None
+
+        def __init__(self, chunks):
+            self.content = Content(chunks)
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+    responses = [Response([b"partial", aiohttp.ClientPayloadError("retry")]), Response([b"done", b""])]
+
+    class Session:
+        def __init__(self, timeout):
+            pass
+
+        async def get(self, url, headers):
+            return responses.pop(0)
+
+        async def close(self):
+            pass
+
+    monkeypatch.setattr(download_helpers.aiohttp, "ClientSession", Session)
+    monkeypatch.setattr(download_helpers, "sleep_with_interrupt", AsyncMock())
+    monkeypatch.setattr(download_helpers, "_MAX_IN_MEMORY_DOWNLOAD_BYTES", 10)
+
+    asyncio.run(download_helpers.download_url_to_bytesio("https://example.com/result", destination))
+    assert destination.read() == b"done"
+
+    monkeypatch.setattr(download_helpers, "_MAX_IN_MEMORY_DOWNLOAD_BYTES", 4)
+    responses.append(Response([b"12345", b""]))
+    with pytest.raises(ValueError, match="in-memory limit"):
+        asyncio.run(download_helpers.download_url_to_bytesio("https://example.com/result", destination))
+    destination.close()
+
+
 def test_download_cloud_audio_url_to_audio_input(monkeypatch):
     node = nodes_comfy_cloud.ComfyCloudTextToImageNode
     downloaded = b"encoded audio"
@@ -399,7 +606,7 @@ def test_audio_poc_request_mapping_and_named_result_decoding(monkeypatch):
     assert request.workflow == "audio.melbandroformer-stem-separation.v1"
     assert request.inputs.model_dump(exclude_none=True) == {"assets": {"audio": {"type": "AUDIO", "url": "/uploads/song.m4a"}}}
     assert [call.args[0] for call in download.await_args_list] == ["/vocals.mp3", "/instruments.mp3"]
-    assert poll.call_args.kwargs["cancel_endpoint"].path == "/tasks/task-audio/cancel"
+    assert poll.call_args.kwargs["cancel_endpoint"].path == "/proxy/comfy-cloud/workflow/tasks/task-audio/cancel"
     assert tuple(output) == ("vocals-audio", "instruments-audio")
 
 
@@ -429,9 +636,48 @@ def test_chatterbox_dialogue_rejects_invalid_speaker_labels(monkeypatch):
     monkeypatch.setattr(nodes_comfy_cloud, "upload_audio_to_comfyapi", upload)
     audio = {"waveform": torch.zeros(1, 1, 48000), "sample_rate": 48000}
 
-    with pytest.raises(ValueError, match="Every nonblank utterance"):
+    with pytest.raises(ValueError, match="only speakers A and B"):
         asyncio.run(nodes_comfy_cloud.ComfyCloudChatterboxDialogueNode.execute("NARRATOR: Hello", audio, audio, 0.5, 0.5, 0.8, 0))
     upload.assert_not_awaited()
+
+
+def test_chatterbox_dialogue_normalizes_labels_and_continuations(monkeypatch):
+    run = AsyncMock(return_value=("audio-output",))
+    monkeypatch.setattr(nodes_comfy_cloud, "_run_audio_workflow", run)
+    monkeypatch.setattr(nodes_comfy_cloud, "upload_audio_to_comfyapi", AsyncMock(side_effect=["/a", "/b"]))
+    audio = {"waveform": torch.zeros(1, 1, 48000), "sample_rate": 48000}
+
+    asyncio.run(nodes_comfy_cloud.ComfyCloudChatterboxDialogueNode.execute("a: Hello\ncontinued\n\nSpeaker B: Hi", audio, audio, 0.5, 0.5, 0.8, 0))
+
+    assert run.call_args.args[2].script == "SPEAKER A: Hello continued\nSPEAKER B: Hi"
+
+
+def test_chatterbox_dialogue_accepts_colons_and_label_only_lines():
+    assert nodes_comfy_cloud._normalize_dialogue("SPEAKER A :\nMeet at 10:30\nhttps://example.com\nB: Done") == (
+        "SPEAKER A: Meet at 10:30 https://example.com\nSPEAKER B: Done"
+    )
+
+
+@pytest.mark.parametrize("script", ["SPEAKER A:", "just a continuation", "   "])
+def test_chatterbox_dialogue_rejects_blank_or_unattributed_text(monkeypatch, script):
+    upload = AsyncMock()
+    monkeypatch.setattr(nodes_comfy_cloud, "upload_audio_to_comfyapi", upload)
+    audio = {"waveform": torch.zeros(1, 1, 48000), "sample_rate": 48000}
+
+    with pytest.raises(Exception):
+        asyncio.run(nodes_comfy_cloud.ComfyCloudChatterboxDialogueNode.execute(script, audio, audio, 0.5, 0.5, 0.8, 0))
+    upload.assert_not_awaited()
+
+
+def test_audio_duration_tolerates_one_sample_and_rejects_invalid_sample_rate():
+    one_sample_over = {"waveform": torch.zeros(1, 1, 48001), "sample_rate": 48000}
+    nodes_comfy_cloud._validate_audio_duration("Audio", one_sample_over, 0.5, 1)
+
+    with pytest.raises(ValueError, match="sample rate"):
+        nodes_comfy_cloud._validate_audio_duration("Audio", {"waveform": torch.zeros(1, 1, 1), "sample_rate": 0}, 0.5, 1)
+
+    with pytest.raises(ValueError, match="between"):
+        nodes_comfy_cloud._validate_audio_duration("Audio", {"waveform": torch.zeros(1, 1, 31), "sample_rate": 1}, 1, 30)
 
 
 @pytest.mark.parametrize(("file_format", "expected_format"), [(".GLB", "glb"), ("SPZ", "spz")])
@@ -521,6 +767,28 @@ def test_3d_poc_schema_defaults_and_ranges():
     assert (panorama["merge_resolution"].default, panorama["merge_resolution"].min, panorama["merge_resolution"].max) == (1024, 256, 8192)
 
 
+def test_hunyuan_multiview_validates_both_images_before_upload(monkeypatch):
+    upload = AsyncMock()
+    monkeypatch.setattr(nodes_comfy_cloud, "upload_image_to_comfyapi", upload)
+    monkeypatch.setattr(nodes_comfy_cloud, "get_number_of_images", lambda image: image)
+
+    with pytest.raises(ValueError, match="Exactly one front image and one back image"):
+        asyncio.run(nodes_comfy_cloud.ComfyCloudHunyuan3DMultiViewTo3DNode.execute(1, 2, 9))
+    upload.assert_not_awaited()
+
+
+def test_extension_preserves_all_23_poc_node_registrations():
+    legacy_nodes = {
+        nodes_comfy_cloud.ComfyCloudTextToImageNode,
+        nodes_comfy_cloud.ComfyCloudTextToVideoNode,
+        nodes_comfy_cloud.ComfyCloudImageToVideoNode,
+        nodes_comfy_cloud.ComfyCloudImageEditNode,
+    }
+    registered = set(asyncio.run(nodes_comfy_cloud.ComfyCloudExtension().get_node_list()))
+
+    assert len(registered - legacy_nodes) == 23
+
+
 def test_3d_workflow_submission_polling_cancel_and_download(monkeypatch):
     sync = AsyncMock(return_value=ComfyCloudGenerateResponse(task_id="task-3d", status="queued", polling_url="/tasks/task-3d", cancel_url="/tasks/task-3d/cancel"))
     poll = AsyncMock(return_value=ComfyCloudStatusResponse(task_id="task-3d", status="completed", output_url="/results/model.spz"))
@@ -534,8 +802,8 @@ def test_3d_workflow_submission_polling_cancel_and_download(monkeypatch):
     request = sync.call_args.kwargs["data"]
     assert request.workflow == "3d.triposplat-image-to-gaussian-splat.v1"
     assert request.inputs.model_dump(exclude_none=True) == {"seed": 46}
-    assert poll.call_args.args[1].path == "/tasks/task-3d"
-    assert poll.call_args.kwargs["cancel_endpoint"].path == "/tasks/task-3d/cancel"
+    assert poll.call_args.args[1].path == "/proxy/comfy-cloud/workflow/tasks/task-3d"
+    assert poll.call_args.kwargs["cancel_endpoint"].path == "/proxy/comfy-cloud/workflow/tasks/task-3d/cancel"
     assert poll.call_args.kwargs["cancel_endpoint"].method == "POST"
     download.assert_awaited_once_with("/results/model.spz", "spz", cls=nodes_comfy_cloud.ComfyCloudTripoSplatImageToGaussianSplatNode)
     assert output[0] == "spz-output"
