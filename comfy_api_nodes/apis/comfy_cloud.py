@@ -20,6 +20,7 @@ ComfyCloudWorkflow = Literal[
 class ComfyCloudWorkflowInputs(BaseModel):
     prompt: str | None = Field(None)
     image_url: str | None = Field(None)
+    assets: dict[str, "ComfyCloudAssetInput"] | None = Field(None)
     instruction: str | None = Field(None)
     prompt_enhance: bool | None = Field(None)
     negative_prompt: str | None = Field(None)
@@ -28,6 +29,11 @@ class ComfyCloudWorkflowInputs(BaseModel):
     quality_mode: str | None = Field(None)
     seed: int | None = Field(None, ge=0, le=0xFFFFFFFFFFFFFFFF)
     scale: str | None = Field(None)
+
+
+class ComfyCloudAssetInput(BaseModel):
+    type: Literal["IMAGE", "VIDEO", "AUDIO"] = Field(...)
+    url: str = Field(...)
 
 
 class ComfyCloudGenerateRequest(BaseModel):

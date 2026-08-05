@@ -190,11 +190,12 @@ def test_image_poc_node_schema_and_request_mapping(monkeypatch, node, workflow, 
     request = sync.call_args.kwargs["data"]
     expected_inputs = {key: value for key, value in arguments.items() if key != "image"}
     if "image" in arguments:
-        expected_inputs["image_url"] = "/uploads/input.png"
+        expected_inputs["assets"] = {"image": {"type": "IMAGE", "url": "/uploads/input.png"}}
 
     assert request.workflow == workflow
     assert request.inputs.model_dump(exclude_none=True) == expected_inputs
     assert "asset_id" not in request.model_dump_json()
+    assert '"id"' not in request.model_dump_json()
     assert upload.await_count == int("image" in arguments)
     if "image" in arguments:
         assert upload.call_args.kwargs == {"total_pixels": None}

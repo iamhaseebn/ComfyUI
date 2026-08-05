@@ -4,6 +4,7 @@ from typing_extensions import override
 
 from comfy_api.latest import IO, ComfyExtension, Input
 from comfy_api_nodes.apis.comfy_cloud import (
+    ComfyCloudAssetInput,
     ComfyCloudGenerateRequest,
     ComfyCloudGenerateResponse,
     ComfyCloudStatusResponse,
@@ -311,7 +312,11 @@ class ComfyCloudFlux2ReferenceEditNode(_ComfyCloudWorkflowNode):
         validate_string(instruction, min_length=1, max_length=4096, field_name="instruction")
         return await cls._run(
             ComfyCloudWorkflowInputs(
-                image_url=await cls._upload_image(image, total_pixels=None),
+                assets={
+                    "image": ComfyCloudAssetInput(
+                        type="IMAGE", url=await cls._upload_image(image, total_pixels=None)
+                    )
+                },
                 instruction=instruction,
                 guidance=guidance,
                 quality_mode=quality_mode,
@@ -352,7 +357,11 @@ class ComfyCloudQwenImageEdit2511Node(_ComfyCloudWorkflowNode):
         validate_string(instruction, min_length=1, max_length=4096, field_name="instruction")
         return await cls._run(
             ComfyCloudWorkflowInputs(
-                image_url=await cls._upload_image(image, total_pixels=None),
+                assets={
+                    "image": ComfyCloudAssetInput(
+                        type="IMAGE", url=await cls._upload_image(image, total_pixels=None)
+                    )
+                },
                 instruction=instruction,
                 quality_mode=quality_mode,
                 seed=seed,
@@ -379,7 +388,14 @@ class ComfyCloudSeedVR2ImageUpscaleNode(_ComfyCloudWorkflowNode):
     @classmethod
     async def execute(cls, image: Input.Image, scale: str = "4x") -> IO.NodeOutput:
         return await cls._run(
-            ComfyCloudWorkflowInputs(image_url=await cls._upload_image(image, total_pixels=None), scale=scale)
+            ComfyCloudWorkflowInputs(
+                assets={
+                    "image": ComfyCloudAssetInput(
+                        type="IMAGE", url=await cls._upload_image(image, total_pixels=None)
+                    )
+                },
+                scale=scale,
+            )
         )
 
 
