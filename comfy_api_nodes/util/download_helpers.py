@@ -11,7 +11,7 @@ import torch
 from aiohttp.client_exceptions import ClientError, ContentTypeError
 
 from comfy_api.latest import IO as COMFY_IO
-from comfy_api.latest import InputImpl, Types
+from comfy_api.latest import Input, InputImpl, Types
 from folder_paths import get_output_directory
 
 from . import request_logger
@@ -24,7 +24,7 @@ from ._helpers import (
 )
 from .client import _diagnose_connectivity
 from .common_exceptions import ApiServerError, LocalNetworkError, ProcessingInterrupted
-from .conversions import bytesio_to_image_tensor
+from .conversions import audio_bytes_to_audio_input, bytesio_to_image_tensor
 
 _RETRY_STATUS = {408, 429, 500, 502, 503, 504}
 
@@ -239,6 +239,19 @@ async def download_url_to_video_output(
     result = BytesIO()
     await download_url_to_bytesio(video_url, result, timeout=timeout, max_retries=max_retries, cls=cls)
     return InputImpl.VideoFromFile(result)
+
+
+async def download_url_to_audio_input(
+    audio_url: str,
+    *,
+    timeout: float = None,
+    max_retries: int = 5,
+    cls: type[COMFY_IO.ComfyNode] = None,
+) -> Input.Audio:
+    """Downloads audio from a URL and decodes it into a Comfy AUDIO input."""
+    result = BytesIO()
+    await download_url_to_bytesio(audio_url, result, timeout=timeout, max_retries=max_retries, cls=cls)
+    return audio_bytes_to_audio_input(result.getvalue())
 
 
 async def download_url_as_bytesio(
