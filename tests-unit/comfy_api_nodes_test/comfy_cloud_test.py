@@ -246,6 +246,62 @@ def test_image_poc_api_declarations_and_extension_registration():
     assert {node for node, _, _, _ in IMAGE_POC_NODES} <= registered
 
 
+@pytest.mark.parametrize(
+    ("node", "input_names"),
+    [
+        (nodes_comfy_cloud.ComfyCloudMiniMaxH3TextSoundNode, ["prompt", "aspect_ratio", "duration_seconds", "seed"]),
+        (nodes_comfy_cloud.ComfyCloudMiniMaxH3ImageSoundNode, ["image", "prompt", "aspect_ratio", "duration_seconds", "seed"]),
+        (nodes_comfy_cloud.ComfyCloudLTX23ImageAudioPerformanceNode, ["image", "audio", "prompt", "enhance_prompt", "duration_seconds", "seed"]),
+        (nodes_comfy_cloud.ComfyCloudLTX23FirstLastFrameNode, ["first_frame", "last_frame", "prompt", "duration_seconds", "seed"]),
+        (nodes_comfy_cloud.ComfyCloudWan22FirstLastFrameNode, ["first_frame", "last_frame", "prompt", "negative_prompt", "duration_seconds", "seed"]),
+        (nodes_comfy_cloud.ComfyCloudSCAIL2CharacterReplacementNode, ["reference_character", "driving_video", "scene_prompt", "driving_subject", "reference_subject", "seed"]),
+    ],
+)
+def test_video_node_schemas_expose_only_manifest_inputs(node, input_names):
+    schema = node.define_schema()
+    assert schema.is_api_node
+    assert [input.id for input in schema.inputs] == input_names
+    assert len(schema.outputs) == 1
+    assert schema.outputs[0].get_io_type() == "VIDEO"
+
+
+def test_ltx_performance_stages_image_and_audio(monkeypatch):
+    run = AsyncMock(return_value=("video-output",))
+    image_upload = AsyncMock(return_value="https://example.com/image.png")
+    audio_upload = AsyncMock(return_value="https://example.com/audio.mp4")
+    monkeypatch.setattr(nodes_comfy_cloud, "_run_video_workflow", run)
+    monkeypatch.setattr(nodes_comfy_cloud, "upload_image_to_comfyapi", image_upload)
+    monkeypatch.setattr(nodes_comfy_cloud, "upload_audio_to_comfyapi", audio_upload)
+    monkeypatch.setattr(nodes_comfy_cloud, "get_number_of_images", lambda image: 1)
+    audio = {"waveform": torch.zeros(1, 1, 480000), "sample_rate": 48000}
+
+    asyncio.run(nodes_comfy_cloud.ComfyCloudLTX23ImageAudioPerformanceNode.execute(object(), audio, "sing", True, 9, 7))
+
+    inputs = run.call_args.args[2]
+    assert inputs.image_url == "https://example.com/image.png"
+    assert inputs.audio_url == "https://example.com/audio.mp4"
+    assert inputs.duration_seconds == 9
+
+
+def test_scail_stages_reference_image_and_driving_video(monkeypatch):
+    run = AsyncMock(return_value=("video-output",))
+    image_upload = AsyncMock(return_value="https://example.com/character.png")
+    video_upload = AsyncMock(return_value="https://example.com/driving.mp4")
+    video = Mock()
+    video.get_frame_count.return_value = 100
+    monkeypatch.setattr(nodes_comfy_cloud, "_run_video_workflow", run)
+    monkeypatch.setattr(nodes_comfy_cloud, "upload_image_to_comfyapi", image_upload)
+    monkeypatch.setattr(nodes_comfy_cloud, "upload_video_to_comfyapi", video_upload)
+    monkeypatch.setattr(nodes_comfy_cloud, "get_number_of_images", lambda image: 1)
+
+    asyncio.run(nodes_comfy_cloud.ComfyCloudSCAIL2CharacterReplacementNode.execute(object(), video, "park", "woman", "human", 1))
+
+    inputs = run.call_args.args[2]
+    assert inputs.reference_character_url == "https://example.com/character.png"
+    assert inputs.driving_video_url == "https://example.com/driving.mp4"
+    video.get_frame_count.assert_called_once()
+
+
 def test_download_cloud_audio_url_to_audio_input(monkeypatch):
     node = nodes_comfy_cloud.ComfyCloudTextToImageNode
     downloaded = b"encoded audio"
