@@ -20,6 +20,12 @@ ComfyCloudWorkflow = Literal[
     "video.ltx-2-3-first-last-frame.v1",
     "video.wan-2-2-14b-first-last-frame.v1",
     "video.scail-2-character-replacement.v1",
+    "audio.ace-step-1-5-xl-turbo.v1",
+    "audio.stable-audio-3-medium.v1",
+    "audio.chatterbox-multilingual-voice-clone.v1",
+    "audio.chatterbox-dialogue.v1",
+    "audio.chatterbox-voice-conversion.v1",
+    "audio.melbandroformer-stem-separation.v1",
 ]
 
 
@@ -45,6 +51,19 @@ class ComfyCloudWorkflowInputs(BaseModel):
     scene_prompt: str | None = Field(None)
     driving_subject: str | None = Field(None)
     reference_subject: str | None = Field(None)
+    style_prompt: str | None = Field(None)
+    lyrics: str | None = Field(None)
+    bpm: int | None = Field(None)
+    time_signature: str | None = Field(None)
+    language: str | None = Field(None)
+    key: str | None = Field(None)
+    expand_prompt: bool | None = Field(None)
+    category: str | None = Field(None)
+    text: str | None = Field(None)
+    exaggeration: float | None = Field(None)
+    cfg_weight: float | None = Field(None)
+    temperature: float | None = Field(None)
+    script: str | None = Field(None)
 
 
 class ComfyCloudAssetInput(BaseModel):
@@ -69,4 +88,5 @@ class ComfyCloudStatusResponse(BaseModel):
     status: str = Field(...)
     progress: float | None = Field(None)
     output_url: str | None = Field(None)
+    output_urls: dict[str, str] | None = Field(None)
     error: str | None = Field(None)

@@ -336,6 +336,104 @@ def test_download_cloud_audio_url_to_audio_input(monkeypatch):
     audio_decode.assert_called_once_with(downloaded)
 
 
+AUDIO_POC_NODES = [
+    (nodes_comfy_cloud.ComfyCloudACEStep15XLTurboNode, "audio.ace-step-1-5-xl-turbo.v1", ["style_prompt", "lyrics", "duration_seconds", "seed", "bpm", "time_signature", "language", "key"]),
+    (nodes_comfy_cloud.ComfyCloudStableAudio3MediumNode, "audio.stable-audio-3-medium.v1", ["prompt", "duration_seconds", "seed", "expand_prompt", "category"]),
+    (nodes_comfy_cloud.ComfyCloudChatterboxMultilingualVoiceCloneNode, "audio.chatterbox-multilingual-voice-clone.v1", ["text", "voice_reference", "language", "exaggeration", "cfg_weight", "temperature", "seed"]),
+    (nodes_comfy_cloud.ComfyCloudChatterboxDialogueNode, "audio.chatterbox-dialogue.v1", ["script", "speaker_a_reference", "speaker_b_reference", "exaggeration", "cfg_weight", "temperature", "seed"]),
+    (nodes_comfy_cloud.ComfyCloudChatterboxVoiceConversionNode, "audio.chatterbox-voice-conversion.v1", ["source_audio", "target_voice_reference", "seed"]),
+    (nodes_comfy_cloud.ComfyCloudMelBandRoFormerStemSeparationNode, "audio.melbandroformer-stem-separation.v1", ["audio"]),
+]
+
+
+@pytest.mark.parametrize(("node", "workflow", "input_names"), AUDIO_POC_NODES)
+def test_audio_poc_schemas_and_registration(node, workflow, input_names):
+    schema = node.define_schema()
+    registered = asyncio.run(nodes_comfy_cloud.ComfyCloudExtension().get_node_list())
+
+    assert schema.is_api_node
+    assert schema.category == "partner/audio/Comfy Cloud"
+    assert [input.id for input in schema.inputs] == input_names
+    assert all(output.get_io_type() == "AUDIO" for output in schema.outputs)
+    assert workflow in get_args(ComfyCloudWorkflow)
+    assert node in registered
+
+
+def test_audio_poc_schema_defaults_ranges_and_enums():
+    schemas = {workflow: {input.id: input for input in node.define_schema().inputs} for node, workflow, _ in AUDIO_POC_NODES}
+    ace = schemas["audio.ace-step-1-5-xl-turbo.v1"]
+    assert (ace["duration_seconds"].default, ace["duration_seconds"].min, ace["duration_seconds"].max, ace["duration_seconds"].step) == (120, 10, 300, 0.1)
+    assert (ace["bpm"].default, ace["bpm"].min, ace["bpm"].max) == (120, 10, 300)
+    assert ace["time_signature"].options == ["2", "3", "4", "6"]
+    assert ace["language"].default == "en"
+    assert ace["key"].default == "E minor"
+
+    stable = schemas["audio.stable-audio-3-medium.v1"]
+    assert stable["category"].options == ["Music", "Instrument", "SFX", "One-shot"]
+    assert stable["expand_prompt"].default is True
+    for workflow in [
+        "audio.chatterbox-multilingual-voice-clone.v1",
+        "audio.chatterbox-dialogue.v1",
+        "audio.chatterbox-voice-conversion.v1",
+    ]:
+        assert schemas[workflow]["seed"].max == 0xFFFFFFFF
+
+    mel_schema = nodes_comfy_cloud.ComfyCloudMelBandRoFormerStemSeparationNode.define_schema()
+    assert [output.id for output in mel_schema.outputs] == ["vocals", "instruments"]
+
+
+def test_audio_poc_request_mapping_and_named_result_decoding(monkeypatch):
+    sync = AsyncMock(return_value=ComfyCloudGenerateResponse(task_id="task-audio", status="queued", polling_url="/tasks/task-audio", cancel_url="/tasks/task-audio/cancel"))
+    poll = AsyncMock(return_value=ComfyCloudStatusResponse(task_id="task-audio", status="completed", output_urls={"vocals": "/vocals.mp3", "instruments": "/instruments.mp3"}))
+    upload = AsyncMock(return_value="/uploads/song.m4a")
+    download = AsyncMock(side_effect=["vocals-audio", "instruments-audio"])
+    monkeypatch.setattr(nodes_comfy_cloud, "sync_op", sync)
+    monkeypatch.setattr(nodes_comfy_cloud, "poll_op", poll)
+    monkeypatch.setattr(nodes_comfy_cloud, "upload_audio_to_comfyapi", upload)
+    monkeypatch.setattr(nodes_comfy_cloud, "download_url_to_audio_input", download)
+    audio = {"waveform": torch.zeros(1, 2, 48000), "sample_rate": 48000}
+
+    output = asyncio.run(nodes_comfy_cloud.ComfyCloudMelBandRoFormerStemSeparationNode.execute(audio))
+
+    request = sync.call_args.kwargs["data"]
+    assert request.workflow == "audio.melbandroformer-stem-separation.v1"
+    assert request.inputs.model_dump(exclude_none=True) == {"assets": {"audio": {"type": "AUDIO", "url": "/uploads/song.m4a"}}}
+    assert [call.args[0] for call in download.await_args_list] == ["/vocals.mp3", "/instruments.mp3"]
+    assert poll.call_args.kwargs["cancel_endpoint"].path == "/tasks/task-audio/cancel"
+    assert tuple(output) == ("vocals-audio", "instruments-audio")
+
+
+def test_chatterbox_audio_inputs_use_named_staged_assets(monkeypatch):
+    run = AsyncMock(return_value=("audio-output",))
+    upload = AsyncMock(side_effect=["/uploads/source.m4a", "/uploads/target.m4a"])
+    monkeypatch.setattr(nodes_comfy_cloud, "_run_audio_workflow", run)
+    monkeypatch.setattr(nodes_comfy_cloud, "upload_audio_to_comfyapi", upload)
+    source = {"waveform": torch.zeros(1, 1, 48000), "sample_rate": 48000}
+    target = {"waveform": torch.zeros(1, 1, 96000), "sample_rate": 48000}
+
+    asyncio.run(nodes_comfy_cloud.ComfyCloudChatterboxVoiceConversionNode.execute(source, target, 7))
+
+    inputs = run.call_args.args[2]
+    assert inputs.model_dump(exclude_none=True) == {
+        "assets": {
+            "source_audio": {"type": "AUDIO", "url": "/uploads/source.m4a"},
+            "target_voice_reference": {"type": "AUDIO", "url": "/uploads/target.m4a"},
+        },
+        "seed": 7,
+    }
+    assert "audio_url" not in inputs.model_dump(exclude_none=True)
+
+
+def test_chatterbox_dialogue_rejects_invalid_speaker_labels(monkeypatch):
+    upload = AsyncMock()
+    monkeypatch.setattr(nodes_comfy_cloud, "upload_audio_to_comfyapi", upload)
+    audio = {"waveform": torch.zeros(1, 1, 48000), "sample_rate": 48000}
+
+    with pytest.raises(ValueError, match="Every nonblank utterance"):
+        asyncio.run(nodes_comfy_cloud.ComfyCloudChatterboxDialogueNode.execute("NARRATOR: Hello", audio, audio, 0.5, 0.5, 0.8, 0))
+    upload.assert_not_awaited()
+
+
 @pytest.mark.parametrize(("file_format", "expected_format"), [(".GLB", "glb"), ("SPZ", "spz")])
 def test_download_cloud_3d_url_to_file_3d(monkeypatch, file_format, expected_format):
     node = nodes_comfy_cloud.ComfyCloudTextToImageNode
