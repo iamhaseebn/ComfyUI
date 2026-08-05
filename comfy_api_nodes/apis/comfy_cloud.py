@@ -3,12 +3,37 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 
-ComfyCloudWorkflow = Literal["text-to-image", "text-to-video", "image-to-video", "image-edit"]
+ComfyCloudWorkflow = Literal[
+    "text-to-image",
+    "text-to-video",
+    "image-to-video",
+    "image-edit",
+    "image.ideogram-4-design.v1",
+    "image.krea-2-creative-image.v1",
+    "image.mage-flow-image.v1",
+    "image.flux-2-reference-edit.v1",
+    "image.qwen-image-edit-2511.v1",
+    "image.seedvr2-image-upscale.v1",
+]
 
 
 class ComfyCloudWorkflowInputs(BaseModel):
-    prompt: str = Field(...)
+    prompt: str | None = Field(None)
     image_url: str | None = Field(None)
+    assets: dict[str, "ComfyCloudAssetInput"] | None = Field(None)
+    instruction: str | None = Field(None)
+    prompt_enhance: bool | None = Field(None)
+    negative_prompt: str | None = Field(None)
+    aspect_ratio: str | None = Field(None)
+    guidance: float | None = Field(None)
+    quality_mode: str | None = Field(None)
+    seed: int | None = Field(None, ge=0, le=0xFFFFFFFFFFFFFFFF)
+    scale: str | None = Field(None)
+
+
+class ComfyCloudAssetInput(BaseModel):
+    type: Literal["IMAGE", "VIDEO", "AUDIO"] = Field(...)
+    url: str = Field(...)
 
 
 class ComfyCloudGenerateRequest(BaseModel):
