@@ -14,6 +14,7 @@ from comfy_api_nodes.apis.comfy_cloud import (
 from comfy_api_nodes.util import (
     ApiEndpoint,
     download_url_to_audio_input,
+    download_url_to_file_3d,
     download_url_to_image_tensor,
     download_url_to_video_output,
     get_number_of_images,
@@ -755,6 +756,142 @@ class ComfyCloudMelBandRoFormerStemSeparationNode(IO.ComfyNode):
         return await _run_audio_workflow(cls, "audio.melbandroformer-stem-separation.v1", ComfyCloudWorkflowInputs(assets=await _audio_asset(cls, "audio", audio)), ("vocals", "instruments"))
 
 
+async def _run_3d_workflow(cls: type[IO.ComfyNode], workflow: ComfyCloudWorkflow, inputs: ComfyCloudWorkflowInputs, file_format: str) -> IO.NodeOutput:
+    task = await sync_op(cls, _GENERATE_ENDPOINT, response_model=ComfyCloudGenerateResponse, data=ComfyCloudGenerateRequest(workflow=workflow, inputs=inputs))
+    result = await poll_op(
+        cls,
+        ApiEndpoint(path=task.polling_url),
+        response_model=ComfyCloudStatusResponse,
+        status_extractor=lambda response: response.status,
+        progress_extractor=lambda response: response.progress,
+        cancel_endpoint=ApiEndpoint(path=task.cancel_url, method="POST"),
+    )
+    if not result.output_url:
+        detail = f": {result.error}" if result.error else ""
+        raise RuntimeError(f"Comfy Cloud task {result.task_id} completed without an output URL{detail}")
+    return IO.NodeOutput(await download_url_to_file_3d(result.output_url, file_format, cls=cls))
+
+
+def _3d_schema(node_id: str, display_name: str, inputs: list[IO.Input], output: IO.Output) -> IO.Schema:
+    return IO.Schema(
+        node_id=node_id,
+        display_name=display_name,
+        category="partner/3d/Comfy Cloud",
+        inputs=inputs,
+        outputs=[output],
+        hidden=[IO.Hidden.auth_token_comfy_org, IO.Hidden.api_key_comfy_org, IO.Hidden.unique_id],
+        is_api_node=True,
+    )
+
+
+async def _image_asset(cls: type[IO.ComfyNode], name: str, image: Input.Image, wait_label: str | None = None) -> dict[str, ComfyCloudAssetInput]:
+    if get_number_of_images(image) != 1:
+        raise ValueError(f"Exactly one {name.replace('_', ' ')} is required.")
+    kwargs = {"total_pixels": None}
+    if wait_label is not None:
+        kwargs["wait_label"] = wait_label
+    return {name: ComfyCloudAssetInput(type="IMAGE", url=await upload_image_to_comfyapi(cls, image, **kwargs))}
+
+
+class ComfyCloudTripoSplatImageToGaussianSplatNode(IO.ComfyNode):
+    @classmethod
+    def define_schema(cls) -> IO.Schema:
+        return _3d_schema(
+            "ComfyCloudTripoSplatImageToGaussianSplatNode",
+            "TripoSplat Image to Gaussian Splat",
+            [
+                IO.Image.Input("image"),
+                IO.Boolean.Input("remove_background", default=True),
+                IO.Int.Input("seed", default=46, min=0, max=_UINT64_MAX, control_after_generate=True),
+                IO.Int.Input("gaussian_count", default=262144, min=32768, max=262144),
+            ],
+            IO.File3DSPZ.Output(tooltip="SPZ Gaussian splat (.spz; POC MIME application/octet-stream)."),
+        )
+
+    @classmethod
+    async def execute(cls, image: Input.Image, remove_background: bool, seed: int, gaussian_count: int) -> IO.NodeOutput:
+        return await _run_3d_workflow(cls, "3d.triposplat-image-to-gaussian-splat.v1", ComfyCloudWorkflowInputs(assets=await _image_asset(cls, "image", image), remove_background=remove_background, seed=seed, gaussian_count=gaussian_count), "spz")
+
+
+class ComfyCloudHunyuan3D21ImageTo3DNode(IO.ComfyNode):
+    @classmethod
+    def define_schema(cls) -> IO.Schema:
+        return _3d_schema(
+            "ComfyCloudHunyuan3D21ImageTo3DNode",
+            "Hunyuan3D 2.1 Image to 3D",
+            [IO.Image.Input("image"), IO.Int.Input("seed", default=952805179515179, min=0, max=_UINT64_MAX, control_after_generate=True)],
+            IO.File3DGLB.Output(),
+        )
+
+    @classmethod
+    async def execute(cls, image: Input.Image, seed: int) -> IO.NodeOutput:
+        return await _run_3d_workflow(cls, "3d.hunyuan3d-2-1-image-to-3d.v1", ComfyCloudWorkflowInputs(assets=await _image_asset(cls, "image", image), seed=seed), "glb")
+
+
+class ComfyCloudHunyuan3DMultiViewTo3DNode(IO.ComfyNode):
+    @classmethod
+    def define_schema(cls) -> IO.Schema:
+        return _3d_schema(
+            "ComfyCloudHunyuan3DMultiViewTo3DNode",
+            "Hunyuan3D Multi-View to 3D",
+            [IO.Image.Input("front_image"), IO.Image.Input("back_image"), IO.Int.Input("seed", default=502126049100058, min=0, max=_UINT64_MAX, control_after_generate=True)],
+            IO.File3DGLB.Output(),
+        )
+
+    @classmethod
+    async def execute(cls, front_image: Input.Image, back_image: Input.Image, seed: int) -> IO.NodeOutput:
+        assets = await _image_asset(cls, "front_image", front_image, "Uploading front image")
+        assets.update(await _image_asset(cls, "back_image", back_image, "Uploading back image"))
+        return await _run_3d_workflow(cls, "3d.hunyuan3d-multiview-to-3d.v1", ComfyCloudWorkflowInputs(assets=assets, seed=seed), "glb")
+
+
+class ComfyCloudMoGe2PhotoToTexturedMeshNode(IO.ComfyNode):
+    @classmethod
+    def define_schema(cls) -> IO.Schema:
+        return _3d_schema(
+            "ComfyCloudMoGe2PhotoToTexturedMeshNode",
+            "MoGe 2 Photo to Textured Mesh",
+            [
+                IO.Image.Input("image"),
+                IO.Float.Input("fov_degrees", default=0, min=0, max=170, step=0.1, tooltip="0 selects automatic field-of-view estimation."),
+                IO.Int.Input("detail", default=9, min=0, max=9),
+                IO.Int.Input("mesh_decimation", default=1, min=1, max=8),
+                IO.Float.Input("gap_threshold", default=0.04, min=0, max=1, step=0.01),
+                IO.Boolean.Input("texture", default=True),
+            ],
+            IO.File3DGLB.Output(),
+        )
+
+    @classmethod
+    async def execute(cls, image: Input.Image, fov_degrees: float, detail: int, mesh_decimation: int, gap_threshold: float, texture: bool) -> IO.NodeOutput:
+        inputs = ComfyCloudWorkflowInputs(assets=await _image_asset(cls, "image", image), fov_degrees=fov_degrees, detail=detail, mesh_decimation=mesh_decimation, gap_threshold=gap_threshold, texture=texture)
+        return await _run_3d_workflow(cls, "3d.moge-2-photo-to-textured-mesh.v1", inputs, "glb")
+
+
+class ComfyCloudMoGe2PanoramaTo3DSceneNode(IO.ComfyNode):
+    @classmethod
+    def define_schema(cls) -> IO.Schema:
+        return _3d_schema(
+            "ComfyCloudMoGe2PanoramaTo3DSceneNode",
+            "MoGe 2 Panorama to 3D Scene",
+            [
+                IO.Image.Input("panorama", tooltip="Equirectangular panorama."),
+                IO.Int.Input("detail", default=5, min=0, max=9),
+                IO.Int.Input("split_resolution", default=512, min=256, max=1024),
+                IO.Int.Input("merge_resolution", default=1024, min=256, max=8192),
+                IO.Int.Input("mesh_decimation", default=1, min=1, max=8),
+                IO.Float.Input("gap_threshold", default=0.04, min=0, max=1, step=0.01),
+                IO.Boolean.Input("texture", default=True),
+            ],
+            IO.File3DGLB.Output(),
+        )
+
+    @classmethod
+    async def execute(cls, panorama: Input.Image, detail: int, split_resolution: int, merge_resolution: int, mesh_decimation: int, gap_threshold: float, texture: bool) -> IO.NodeOutput:
+        inputs = ComfyCloudWorkflowInputs(assets=await _image_asset(cls, "panorama", panorama), detail=detail, split_resolution=split_resolution, merge_resolution=merge_resolution, mesh_decimation=mesh_decimation, gap_threshold=gap_threshold, texture=texture)
+        return await _run_3d_workflow(cls, "3d.moge-2-panorama-to-3d-scene.v1", inputs, "glb")
+
+
 class ComfyCloudExtension(ComfyExtension):
     @override
     async def get_node_list(self) -> list[type[IO.ComfyNode]]:
@@ -781,6 +918,11 @@ class ComfyCloudExtension(ComfyExtension):
             ComfyCloudChatterboxDialogueNode,
             ComfyCloudChatterboxVoiceConversionNode,
             ComfyCloudMelBandRoFormerStemSeparationNode,
+            ComfyCloudTripoSplatImageToGaussianSplatNode,
+            ComfyCloudHunyuan3D21ImageTo3DNode,
+            ComfyCloudHunyuan3DMultiViewTo3DNode,
+            ComfyCloudMoGe2PhotoToTexturedMeshNode,
+            ComfyCloudMoGe2PanoramaTo3DSceneNode,
         ]
 
 

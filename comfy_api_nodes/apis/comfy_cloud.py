@@ -26,6 +26,11 @@ ComfyCloudWorkflow = Literal[
     "audio.chatterbox-dialogue.v1",
     "audio.chatterbox-voice-conversion.v1",
     "audio.melbandroformer-stem-separation.v1",
+    "3d.triposplat-image-to-gaussian-splat.v1",
+    "3d.hunyuan3d-2-1-image-to-3d.v1",
+    "3d.hunyuan3d-multiview-to-3d.v1",
+    "3d.moge-2-photo-to-textured-mesh.v1",
+    "3d.moge-2-panorama-to-3d-scene.v1",
 ]
 
 
@@ -64,6 +69,15 @@ class ComfyCloudWorkflowInputs(BaseModel):
     cfg_weight: float | None = Field(None)
     temperature: float | None = Field(None)
     script: str | None = Field(None)
+    remove_background: bool | None = Field(None)
+    gaussian_count: int | None = Field(None)
+    fov_degrees: float | None = Field(None)
+    detail: int | None = Field(None)
+    mesh_decimation: int | None = Field(None)
+    gap_threshold: float | None = Field(None)
+    texture: bool | None = Field(None)
+    split_resolution: int | None = Field(None)
+    merge_resolution: int | None = Field(None)
 
 
 class ComfyCloudAssetInput(BaseModel):

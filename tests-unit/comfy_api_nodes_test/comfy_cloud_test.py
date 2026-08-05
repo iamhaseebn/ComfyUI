@@ -462,3 +462,80 @@ def test_download_cloud_3d_url_to_file_3d(monkeypatch, file_format, expected_for
     assert calls[0][0] == f"/proxy/comfy-cloud/results/task-1/model.{expected_format}"
     assert isinstance(calls[0][1], BytesIO)
     assert calls[0][2] == {"timeout": 45, "max_retries": 3, "cls": node}
+
+
+THREE_D_POC_NODES = [
+    (nodes_comfy_cloud.ComfyCloudTripoSplatImageToGaussianSplatNode, "3d.triposplat-image-to-gaussian-splat.v1", ["image", "remove_background", "seed", "gaussian_count"], {"image": object(), "remove_background": False, "seed": 7, "gaussian_count": 32768}, "FILE_3D_SPZ", "spz"),
+    (nodes_comfy_cloud.ComfyCloudHunyuan3D21ImageTo3DNode, "3d.hunyuan3d-2-1-image-to-3d.v1", ["image", "seed"], {"image": object(), "seed": 8}, "FILE_3D_GLB", "glb"),
+    (nodes_comfy_cloud.ComfyCloudHunyuan3DMultiViewTo3DNode, "3d.hunyuan3d-multiview-to-3d.v1", ["front_image", "back_image", "seed"], {"front_image": object(), "back_image": object(), "seed": 9}, "FILE_3D_GLB", "glb"),
+    (nodes_comfy_cloud.ComfyCloudMoGe2PhotoToTexturedMeshNode, "3d.moge-2-photo-to-textured-mesh.v1", ["image", "fov_degrees", "detail", "mesh_decimation", "gap_threshold", "texture"], {"image": object(), "fov_degrees": 45.5, "detail": 8, "mesh_decimation": 2, "gap_threshold": 0.05, "texture": False}, "FILE_3D_GLB", "glb"),
+    (nodes_comfy_cloud.ComfyCloudMoGe2PanoramaTo3DSceneNode, "3d.moge-2-panorama-to-3d-scene.v1", ["panorama", "detail", "split_resolution", "merge_resolution", "mesh_decimation", "gap_threshold", "texture"], {"panorama": object(), "detail": 6, "split_resolution": 768, "merge_resolution": 2048, "mesh_decimation": 3, "gap_threshold": 0.06, "texture": False}, "FILE_3D_GLB", "glb"),
+]
+
+
+@pytest.mark.parametrize(("node", "workflow", "input_names", "arguments", "output_type", "file_format"), THREE_D_POC_NODES)
+def test_3d_poc_node_schema_request_mapping_and_registration(monkeypatch, node, workflow, input_names, arguments, output_type, file_format):
+    run = AsyncMock(return_value=("3d-output",))
+    upload = AsyncMock(side_effect=["/uploads/front.png", "/uploads/back.png"])
+    monkeypatch.setattr(nodes_comfy_cloud, "_run_3d_workflow", run)
+    monkeypatch.setattr(nodes_comfy_cloud, "upload_image_to_comfyapi", upload)
+    monkeypatch.setattr(nodes_comfy_cloud, "get_number_of_images", lambda image: 1)
+
+    schema = node.define_schema()
+    assert schema.is_api_node
+    assert schema.category == "partner/3d/Comfy Cloud"
+    assert [input.id for input in schema.inputs] == input_names
+    assert schema.outputs[0].get_io_type() == output_type
+    assert workflow in get_args(ComfyCloudWorkflow)
+    assert node in asyncio.run(nodes_comfy_cloud.ComfyCloudExtension().get_node_list())
+
+    output = asyncio.run(node.execute(**arguments))
+    assert output[0] == "3d-output"
+    assert run.call_args.args[1] == workflow
+    assert run.call_args.args[3] == file_format
+    request_inputs = run.call_args.args[2].model_dump(exclude_none=True)
+    image_names = [name for name in ("image", "front_image", "back_image", "panorama") if name in arguments]
+    expected_inputs = {name: value for name, value in arguments.items() if name not in image_names}
+    expected_inputs["assets"] = {
+        name: {"type": "IMAGE", "url": f"/uploads/{'front' if index == 0 else 'back'}.png"}
+        for index, name in enumerate(image_names)
+    }
+    assert request_inputs == expected_inputs
+    assert '"id"' not in run.call_args.args[2].model_dump_json()
+
+
+def test_3d_poc_schema_defaults_and_ranges():
+    schemas = {workflow: {input.id: input for input in node.define_schema().inputs} for node, workflow, _, _, _, _ in THREE_D_POC_NODES}
+    tripo = schemas["3d.triposplat-image-to-gaussian-splat.v1"]
+    assert tripo["remove_background"].default is True
+    assert (tripo["seed"].default, tripo["seed"].min, tripo["seed"].max) == (46, 0, 0xFFFFFFFFFFFFFFFF)
+    assert (tripo["gaussian_count"].default, tripo["gaussian_count"].min, tripo["gaussian_count"].max) == (262144, 32768, 262144)
+    assert "application/octet-stream" in nodes_comfy_cloud.ComfyCloudTripoSplatImageToGaussianSplatNode.define_schema().outputs[0].tooltip
+    assert schemas["3d.hunyuan3d-2-1-image-to-3d.v1"]["seed"].default == 952805179515179
+    assert schemas["3d.hunyuan3d-multiview-to-3d.v1"]["seed"].default == 502126049100058
+    photo = schemas["3d.moge-2-photo-to-textured-mesh.v1"]
+    assert (photo["fov_degrees"].default, photo["fov_degrees"].min, photo["fov_degrees"].max, photo["fov_degrees"].step) == (0, 0, 170, 0.1)
+    assert (photo["detail"].default, photo["detail"].min, photo["detail"].max) == (9, 0, 9)
+    panorama = schemas["3d.moge-2-panorama-to-3d-scene.v1"]
+    assert (panorama["split_resolution"].default, panorama["split_resolution"].min, panorama["split_resolution"].max) == (512, 256, 1024)
+    assert (panorama["merge_resolution"].default, panorama["merge_resolution"].min, panorama["merge_resolution"].max) == (1024, 256, 8192)
+
+
+def test_3d_workflow_submission_polling_cancel_and_download(monkeypatch):
+    sync = AsyncMock(return_value=ComfyCloudGenerateResponse(task_id="task-3d", status="queued", polling_url="/tasks/task-3d", cancel_url="/tasks/task-3d/cancel"))
+    poll = AsyncMock(return_value=ComfyCloudStatusResponse(task_id="task-3d", status="completed", output_url="/results/model.spz"))
+    download = AsyncMock(return_value="spz-output")
+    monkeypatch.setattr(nodes_comfy_cloud, "sync_op", sync)
+    monkeypatch.setattr(nodes_comfy_cloud, "poll_op", poll)
+    monkeypatch.setattr(nodes_comfy_cloud, "download_url_to_file_3d", download)
+
+    output = asyncio.run(nodes_comfy_cloud._run_3d_workflow(nodes_comfy_cloud.ComfyCloudTripoSplatImageToGaussianSplatNode, "3d.triposplat-image-to-gaussian-splat.v1", ComfyCloudWorkflowInputs(seed=46), "spz"))
+
+    request = sync.call_args.kwargs["data"]
+    assert request.workflow == "3d.triposplat-image-to-gaussian-splat.v1"
+    assert request.inputs.model_dump(exclude_none=True) == {"seed": 46}
+    assert poll.call_args.args[1].path == "/tasks/task-3d"
+    assert poll.call_args.kwargs["cancel_endpoint"].path == "/tasks/task-3d/cancel"
+    assert poll.call_args.kwargs["cancel_endpoint"].method == "POST"
+    download.assert_awaited_once_with("/results/model.spz", "spz", cls=nodes_comfy_cloud.ComfyCloudTripoSplatImageToGaussianSplatNode)
+    assert output[0] == "spz-output"
