@@ -214,6 +214,7 @@ class ComfyCloudIdeogram4DesignNode(_ComfyCloudWorkflowNode):
         )
 
     @classmethod
+    # pylint: disable=arguments-renamed
     async def execute(
         cls, prompt: str, aspect_ratio: str = "1:1", quality_mode: str = "balanced", seed: int = 0
     ) -> IO.NodeOutput:
@@ -247,6 +248,7 @@ class ComfyCloudKrea2CreativeImageNode(_ComfyCloudWorkflowNode):
         )
 
     @classmethod
+    # pylint: disable=arguments-renamed
     async def execute(
         cls, prompt: str, prompt_enhance: bool = True, aspect_ratio: str = "1:1", seed: int = 0
     ) -> IO.NodeOutput:
@@ -280,6 +282,7 @@ class ComfyCloudMageFlowImageNode(_ComfyCloudWorkflowNode):
         )
 
     @classmethod
+    # pylint: disable=arguments-renamed
     async def execute(
         cls, prompt: str, negative_prompt: str = "", aspect_ratio: str = "1:1", seed: int = 0
     ) -> IO.NodeOutput:
@@ -315,6 +318,7 @@ class ComfyCloudFlux2ReferenceEditNode(_ComfyCloudWorkflowNode):
         )
 
     @classmethod
+    # pylint: disable=arguments-renamed
     async def execute(
         cls,
         image: Input.Image,
@@ -361,6 +365,7 @@ class ComfyCloudQwenImageEdit2511Node(_ComfyCloudWorkflowNode):
         )
 
     @classmethod
+    # pylint: disable=arguments-renamed
     async def execute(
         cls,
         image: Input.Image,
@@ -400,6 +405,7 @@ class ComfyCloudSeedVR2ImageUpscaleNode(_ComfyCloudWorkflowNode):
         )
 
     @classmethod
+    # pylint: disable=arguments-renamed
     async def execute(cls, image: Input.Image, scale: str = "4x") -> IO.NodeOutput:
         return await cls._run(
             ComfyCloudWorkflowInputs(
