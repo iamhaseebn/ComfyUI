@@ -302,6 +302,15 @@ def test_image_poc_api_declarations_and_extension_registration():
     assert {node for node, _, _, _ in IMAGE_POC_NODES} <= registered
 
 
+def test_cloud_workflow_controls_have_connection_sockets():
+    nodes = asyncio.run(nodes_comfy_cloud.ComfyCloudExtension().get_node_list())
+
+    for node in nodes:
+        for input_spec in node.define_schema().inputs:
+            if isinstance(input_spec, nodes_comfy_cloud.IO.WidgetInput):
+                assert input_spec.socketless is False, f"{node.__name__}.{input_spec.id}"
+
+
 @pytest.mark.parametrize(
     ("node", "input_names"),
     [

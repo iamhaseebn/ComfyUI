@@ -39,6 +39,13 @@ def _task_endpoints(task_id: str) -> tuple[ApiEndpoint, ApiEndpoint]:
     return ApiEndpoint(path=task_path), ApiEndpoint(path=f"{task_path}/cancel", method="POST")
 
 
+def _with_input_sockets(inputs: list[IO.Input]) -> list[IO.Input]:
+    for input_spec in inputs:
+        if isinstance(input_spec, IO.WidgetInput):
+            input_spec.socketless = False
+    return inputs
+
+
 class _ComfyCloudWorkflowNode(IO.ComfyNode):
     workflow: ClassVar[ComfyCloudWorkflow]
     node_id: ClassVar[str]
@@ -65,7 +72,7 @@ class _ComfyCloudWorkflowNode(IO.ComfyNode):
             node_id=cls.node_id,
             display_name=cls.display_name,
             category=cls.category,
-            inputs=inputs,
+            inputs=_with_input_sockets(inputs),
             outputs=[output],
             hidden=[
                 IO.Hidden.auth_token_comfy_org,
@@ -179,7 +186,7 @@ def _image_schema(node_id: str, display_name: str, inputs: list[IO.Input]) -> IO
         node_id=node_id,
         display_name=display_name,
         category="partner/image/Comfy Cloud",
-        inputs=inputs,
+        inputs=_with_input_sockets(inputs),
         outputs=[IO.Image.Output()],
         hidden=[
             IO.Hidden.auth_token_comfy_org,
@@ -440,7 +447,7 @@ def _video_schema(node_id: str, display_name: str, inputs: list[IO.Input]) -> IO
         node_id=node_id,
         display_name=display_name,
         category="partner/video/Comfy Cloud",
-        inputs=inputs,
+        inputs=_with_input_sockets(inputs),
         outputs=[IO.Video.Output()],
         hidden=[IO.Hidden.auth_token_comfy_org, IO.Hidden.api_key_comfy_org, IO.Hidden.unique_id],
         is_api_node=True,
@@ -594,7 +601,7 @@ def _audio_schema(node_id: str, display_name: str, inputs: list[IO.Input], outpu
         node_id=node_id,
         display_name=display_name,
         category="partner/audio/Comfy Cloud",
-        inputs=inputs,
+        inputs=_with_input_sockets(inputs),
         outputs=outputs or [IO.Audio.Output()],
         hidden=[IO.Hidden.auth_token_comfy_org, IO.Hidden.api_key_comfy_org, IO.Hidden.unique_id],
         is_api_node=True,
@@ -822,7 +829,7 @@ def _3d_schema(node_id: str, display_name: str, inputs: list[IO.Input], output: 
         node_id=node_id,
         display_name=display_name,
         category="partner/3d/Comfy Cloud",
-        inputs=inputs,
+        inputs=_with_input_sockets(inputs),
         outputs=[output],
         hidden=[IO.Hidden.auth_token_comfy_org, IO.Hidden.api_key_comfy_org, IO.Hidden.unique_id],
         is_api_node=True,
