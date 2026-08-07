@@ -311,6 +311,13 @@ def test_cloud_workflow_controls_have_connection_sockets():
                 assert input_spec.socketless is False, f"{node.__name__}.{input_spec.id}"
 
 
+def test_cloud_workflow_schemas_have_descriptions():
+    nodes = asyncio.run(nodes_comfy_cloud.ComfyCloudExtension().get_node_list())
+
+    for node in nodes:
+        assert node.define_schema().description.strip(), node.__name__
+
+
 @pytest.mark.parametrize(
     ("node", "input_names"),
     [
