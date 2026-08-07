@@ -125,10 +125,11 @@ def test_contract_rejects_empty_task_ids(response_model, task_id):
 @pytest.mark.parametrize(
     "url",
     [
-        "https://example.com/output.png",
+        "http://example.com/output.png",
         "http://127.0.0.1/output.png",
         "//169.254.169.254/latest/meta-data",
         "/unrelated/path/output.png",
+        "https://user@example.com/output.png",
     ],
 )
 def test_cloud_workflows_reject_untrusted_output_urls(monkeypatch, url):
@@ -151,6 +152,38 @@ def test_cloud_workflows_reject_untrusted_output_urls(monkeypatch, url):
     with pytest.raises(RuntimeError, match="invalid output URL"):
         asyncio.run(nodes_comfy_cloud.ComfyCloudTextToImageNode.execute("prompt"))
     download.assert_not_awaited()
+
+
+def test_cloud_workflows_accept_signed_https_output_urls(monkeypatch):
+    sync = AsyncMock(
+        return_value=ComfyCloudGenerateResponse(
+            task_id="task-1",
+            status="queued",
+            polling_url="/poll",
+            cancel_url="/cancel",
+        )
+    )
+    poll = AsyncMock(
+        return_value=ComfyCloudStatusResponse(
+            task_id="task-1",
+            status="completed",
+            output_url="https://storage.googleapis.com/comfy-cloud/output.png?signature=example",
+        )
+    )
+    download = AsyncMock(return_value="image-output")
+    monkeypatch.setattr(nodes_comfy_cloud, "sync_op", sync)
+    monkeypatch.setattr(nodes_comfy_cloud, "poll_op", poll)
+    monkeypatch.setattr(nodes_comfy_cloud, "download_url_to_image_tensor", download)
+
+    output = asyncio.run(nodes_comfy_cloud.ComfyCloudTextToImageNode.execute("prompt"))
+
+    assert output[0] == "image-output"
+    download.assert_awaited_once_with(
+        "https://storage.googleapis.com/comfy-cloud/output.png?signature=example",
+        timeout=nodes_comfy_cloud._OUTPUT_DOWNLOAD_TIMEOUT,
+        cls=nodes_comfy_cloud.ComfyCloudTextToImageNode,
+        allow_redirects=False,
+    )
 
 
 @pytest.mark.parametrize(

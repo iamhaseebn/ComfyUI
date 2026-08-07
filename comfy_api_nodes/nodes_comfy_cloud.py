@@ -85,7 +85,9 @@ def _with_input_sockets(inputs: list[IO.Input]) -> list[IO.Input]:
 
 def _validated_output_url(url: str) -> str:
     parsed = urlsplit(url)
-    if parsed.scheme or parsed.netloc or not parsed.path.startswith("/proxy/comfy-cloud/"):
+    is_proxy_path = not parsed.scheme and not parsed.netloc and parsed.path.startswith("/proxy/comfy-cloud/")
+    is_signed_https_url = parsed.scheme == "https" and bool(parsed.netloc) and parsed.username is None
+    if not is_proxy_path and not is_signed_https_url:
         raise RuntimeError("Comfy Cloud returned an invalid output URL.")
     return url
 
