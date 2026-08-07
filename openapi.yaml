@@ -35,6 +35,10 @@ components:
                     description: Timestamp when the asset was last accessed
                     format: date-time
                     type: string
+                loader_path:
+                    description: The bare value a loader widget consumes for this asset. For models it is the path inside the category folder (e.g. "flux.safetensors" for "models/checkpoints/flux.safetensors"), which is what the model resolver matches. For input/output/temp it is the content hash, because those assets are fetched by hash rather than staged by name — that is the value LoadImage-style widgets must carry. Clients add the "[output]"/"[temp]" annotation from the asset's own type, so it is never included here. Null when no such value can be derived.
+                    nullable: true
+                    type: string
                 metadata:
                     additionalProperties: true
                     description: System-managed metadata from download sources (HuggingFace, CivitAI, etc.) - read-only, not user-modifiable
@@ -165,6 +169,10 @@ components:
                     format: uuid
                     nullable: true
                     type: string
+                loader_path:
+                    description: The bare value a loader widget consumes for this asset. For models it is the path inside the category folder (e.g. "flux.safetensors" for "models/checkpoints/flux.safetensors"), which is what the model resolver matches. For input/output/temp it is the content hash, because those assets are fetched by hash rather than staged by name — that is the value LoadImage-style widgets must carry. Clients add the "[output]"/"[temp]" annotation from the asset's own type, so it is never included here. Null when no such value can be derived.
+                    nullable: true
+                    type: string
                 mime_type:
                     description: Updated MIME type of the asset
                     type: string
@@ -187,6 +195,31 @@ components:
             required:
                 - id
                 - updated_at
+            type: object
+        ChurnkeyAuthResponse:
+            description: |
+                Credentials the Churnkey embed requires to launch the cancel flow.
+                `auth_hash` is hex-encoded HMAC-SHA256 of `customer_id` signed with the
+                server's CHURNKEY_HMAC_SECRET; it is bound to that single customer ID
+                and must not be reused for other customers.
+            properties:
+                auth_hash:
+                    description: Hex-encoded HMAC-SHA256(customer_id, CHURNKEY_HMAC_SECRET)
+                    type: string
+                customer_id:
+                    description: Stripe customer ID for the workspace
+                    type: string
+                mode:
+                    description: Churnkey environment matching the configured app
+                    enum:
+                        - live
+                        - test
+                        - sandbox
+                    type: string
+            required:
+                - customer_id
+                - auth_hash
+                - mode
             type: object
         CreateWorkflowRequest:
             description: Request body for creating a new saved workflow.
@@ -511,6 +544,25 @@ components:
             required:
                 - history
             type: object
+        JobAssetsResponse:
+            description: Paginated list of the assets produced by a single job.
+            properties:
+                assets:
+                    description: The job's output assets for the requested page (empty when the job produced none)
+                    items:
+                        $ref: '#/components/schemas/JobOutputAsset'
+                    type: array
+                job_id:
+                    description: ID of the job these assets belong to
+                    format: uuid
+                    type: string
+                pagination:
+                    $ref: '#/components/schemas/PaginationInfo'
+            required:
+                - job_id
+                - assets
+                - pagination
+            type: object
         JobCancelResponse:
             description: Response for POST /api/jobs/{job_id}/cancel. Returned on both fresh cancels and idempotent no-ops.
             properties:
@@ -661,6 +713,56 @@ components:
                 - id
                 - status
                 - create_time
+            type: object
+        JobOutputAsset:
+            description: |
+                An asset produced by a job, enriched with the per-output node context
+                (`node_id`, `output_key`, `output_index`) correlated from the job's
+                execution outputs by content hash. The node-context fields are null
+                when the asset cannot be matched to an output entry.
+            properties:
+                created_at:
+                    description: Timestamp when the asset was created
+                    format: date-time
+                    type: string
+                hash:
+                    description: Blake3 hash of the asset content.
+                    pattern: ^blake3:[a-f0-9]{64}$
+                    type: string
+                id:
+                    description: Unique identifier for the asset
+                    format: uuid
+                    type: string
+                mime_type:
+                    description: MIME type of the asset
+                    type: string
+                name:
+                    description: Name of the asset file
+                    type: string
+                node_id:
+                    description: ID of the workflow node that produced this asset, if known
+                    nullable: true
+                    type: string
+                output_index:
+                    description: Zero-based index of this asset within the node's output slot, if known
+                    nullable: true
+                    type: integer
+                output_key:
+                    description: Output slot key under the producing node (e.g. "images"), if known
+                    nullable: true
+                    type: string
+                preview_url:
+                    description: Relative URL for asset preview/thumbnail
+                    format: uri-reference
+                    type: string
+                size:
+                    description: Size of the asset in bytes
+                    format: int64
+                    type: integer
+            required:
+                - id
+                - name
+                - created_at
             type: object
         JobStatusResponse:
             description: Job status information
@@ -2382,6 +2484,49 @@ paths:
             summary: Get tag histogram for filtered assets
             tags:
                 - file
+    /api/billing/churnkey/auth:
+        get:
+            description: |
+                Returns the Stripe customer identifier and a server-signed
+                HMAC-SHA256 of the customer ID, used to launch the Churnkey-hosted
+                cancellation flow embed.
+            operationId: getChurnkeyAuth
+            responses:
+                "200":
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/ChurnkeyAuthResponse'
+                    description: Success
+                "401":
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/ErrorResponse'
+                    description: Unauthorized
+                "404":
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/ErrorResponse'
+                    description: Workspace has no Stripe customer (never subscribed)
+                "500":
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/ErrorResponse'
+                    description: Internal server error
+                "503":
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/ErrorResponse'
+                    description: Churnkey is not configured on the server
+            security:
+                - BearerAuth: []
+            summary: Get Churnkey HMAC auth credentials
+            tags:
+                - billing
     /api/embeddings:
         get:
             description: Returns the list of text-encoder embeddings available on disk.
@@ -3097,6 +3242,74 @@ paths:
             summary: Get full job details
             tags:
                 - workflow
+    /api/jobs/{job_id}/assets:
+        get:
+            description: |
+                Retrieve a paginated list of the assets produced by a specific job,
+                enriched with the per-output node context (`node_id`, `output_key`,
+                `output_index`) correlated from the job's execution outputs by content
+                hash. Unlike `GET /api/assets?job_ids={id}`, this endpoint is scoped to a
+                single job and carries node-level placement, making it suited to job
+                output views rather than the general asset browser. Returns an empty
+                `assets` array for jobs that produced no assets.
+            operationId: getJobAssets
+            parameters:
+                - description: Job identifier (UUID)
+                  in: path
+                  name: job_id
+                  required: true
+                  schema:
+                    format: uuid
+                    type: string
+                - description: Maximum number of assets to return (1-500)
+                  in: query
+                  name: limit
+                  schema:
+                    default: 20
+                    maximum: 500
+                    minimum: 1
+                    type: integer
+                - description: Number of assets to skip for pagination
+                  in: query
+                  name: offset
+                  schema:
+                    default: 0
+                    minimum: 0
+                    type: integer
+            responses:
+                "200":
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/JobAssetsResponse'
+                    description: Success - Job assets returned
+                "400":
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/ErrorResponse'
+                    description: Invalid request parameters
+                "401":
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/ErrorResponse'
+                    description: Unauthorized - Authentication required
+                "404":
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/ErrorResponse'
+                    description: Job not found or does not belong to the user
+                "500":
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/ErrorResponse'
+                    description: Internal server error
+            summary: List a job's output assets
+            tags:
+                - workflow
     /api/jobs/{job_id}/cancel:
         post:
             description: |
@@ -3302,6 +3515,12 @@ paths:
                             schema:
                                 $ref: '#/components/schemas/PromptErrorResponse'
                     description: Payment required - Insufficient credits
+                "403":
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/PromptErrorResponse'
+                    description: Workspace governance policy blocks one or more partner providers (error.type PARTNER_NODE_DISABLED; error.class_types lists the offending nodes, error.providers the disabled providers)
                 "413":
                     content:
                         application/json:
@@ -3313,7 +3532,7 @@ paths:
                         application/json:
                             schema:
                                 $ref: '#/components/schemas/PromptErrorResponse'
-                    description: Payment required - User has not paid
+                    description: 'Retryable backpressure. Two distinct causes, disambiguated by the body''s `error.type`, NOT by parsing `error.message`: `PAYMENT_REQUIRED` / `FREE_TIER_UNAVAILABLE` / `FREE_TIER_EXHAUSTED` / `PARTNER_NODE_PAYMENT_REQUIRED` (a billing gate - retrying without paying never succeeds), or `QUEUE_LIMIT` (this workspace''s bounded job queue is full - retrying after some queued jobs complete will succeed).'
                 "500":
                     content:
                         application/json:
@@ -5152,6 +5371,8 @@ tags:
       name: user
     - description: Background task management
       name: task
+    - description: Workspace billing and subscription management
+      name: billing
     - description: Workflow storage and version management
       name: workflows
     - description: Job queue state and control
