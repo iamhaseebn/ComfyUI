@@ -37,6 +37,24 @@ _OUTPUT_DOWNLOAD_TIMEOUT = 30 * 60
 _MAX_UPLOAD_IMAGE_PIXELS = 32_000_000
 _MAX_UPLOAD_IMAGE_DIMENSION = 8192
 _MAX_DECODED_AUDIO_BYTES = 256 * 1024 * 1024
+COMFY_CLOUD_GPU_SECOND_USD = 0.001295
+COMFY_CLOUD_CREDITS_PER_USD = 211
+COMFY_CLOUD_GPU_SECOND_CREDITS = COMFY_CLOUD_GPU_SECOND_USD * COMFY_CLOUD_CREDITS_PER_USD
+COMFY_CLOUD_GPU_HOUR_USD = COMFY_CLOUD_GPU_SECOND_USD * 3600
+COMFY_CLOUD_GPU_HOUR_CREDITS = COMFY_CLOUD_GPU_SECOND_CREDITS * 3600
+_COMFY_CLOUD_PRICE_BADGE = IO.PriceBadge(
+    expr=(
+        f'{{"type":"usd","usd":{COMFY_CLOUD_GPU_SECOND_USD:.6f},'
+        '"format":{"suffix":"/GPU-second","approximate":true}}'
+    )
+)
+_COMFY_CLOUD_RATE_DESCRIPTION = (
+    f" Estimated compute rate: ${COMFY_CLOUD_GPU_SECOND_USD:.6f}/GPU-second "
+    f"({COMFY_CLOUD_GPU_SECOND_CREDITS:.6f} credits/GPU-second using "
+    f"{COMFY_CLOUD_CREDITS_PER_USD} credits/USD; ${COMFY_CLOUD_GPU_HOUR_USD:.3f} or "
+    f"{COMFY_CLOUD_GPU_HOUR_CREDITS:.3f} credits/GPU-hour). "
+    "Actual final cost depends on GPU runtime."
+)
 _TEXT_LIMITS = {
     "prompt": (1, 4096),
     "instruction": (1, 4096),
@@ -159,7 +177,8 @@ class _ComfyCloudWorkflowNode(IO.ComfyNode):
             node_id=cls.node_id,
             display_name=cls.display_name,
             category=cls.category,
-            description="Runs this workflow on Comfy Cloud and returns the generated media.",
+            description="Runs this workflow on Comfy Cloud and returns the generated media."
+            + _COMFY_CLOUD_RATE_DESCRIPTION,
             inputs=_with_input_sockets(inputs),
             outputs=[output],
             hidden=[
@@ -168,6 +187,7 @@ class _ComfyCloudWorkflowNode(IO.ComfyNode):
                 IO.Hidden.unique_id,
             ],
             is_api_node=True,
+            price_badge=_COMFY_CLOUD_PRICE_BADGE,
         )
 
     @classmethod
@@ -284,7 +304,8 @@ def _image_schema(node_id: str, display_name: str, inputs: list[IO.Input]) -> IO
         node_id=node_id,
         display_name=display_name,
         category="partner/image/Comfy Cloud",
-        description="Runs this image workflow on Comfy Cloud and returns the generated image.",
+        description="Runs this image workflow on Comfy Cloud and returns the generated image."
+        + _COMFY_CLOUD_RATE_DESCRIPTION,
         inputs=_with_input_sockets(inputs),
         outputs=[IO.Image.Output()],
         hidden=[
@@ -293,6 +314,7 @@ def _image_schema(node_id: str, display_name: str, inputs: list[IO.Input]) -> IO
             IO.Hidden.unique_id,
         ],
         is_api_node=True,
+        price_badge=_COMFY_CLOUD_PRICE_BADGE,
     )
 
 
@@ -559,11 +581,13 @@ def _video_schema(node_id: str, display_name: str, inputs: list[IO.Input]) -> IO
         node_id=node_id,
         display_name=display_name,
         category="partner/video/Comfy Cloud",
-        description="Runs this video workflow on Comfy Cloud and returns the generated video.",
+        description="Runs this video workflow on Comfy Cloud and returns the generated video."
+        + _COMFY_CLOUD_RATE_DESCRIPTION,
         inputs=_with_input_sockets(inputs),
         outputs=[IO.Video.Output()],
         hidden=[IO.Hidden.auth_token_comfy_org, IO.Hidden.api_key_comfy_org, IO.Hidden.unique_id],
         is_api_node=True,
+        price_badge=_COMFY_CLOUD_PRICE_BADGE,
     )
 
 
@@ -735,11 +759,13 @@ def _audio_schema(node_id: str, display_name: str, inputs: list[IO.Input], outpu
         node_id=node_id,
         display_name=display_name,
         category="partner/audio/Comfy Cloud",
-        description="Runs this audio workflow on Comfy Cloud and returns the generated audio.",
+        description="Runs this audio workflow on Comfy Cloud and returns the generated audio."
+        + _COMFY_CLOUD_RATE_DESCRIPTION,
         inputs=_with_input_sockets(inputs),
         outputs=outputs or [IO.Audio.Output()],
         hidden=[IO.Hidden.auth_token_comfy_org, IO.Hidden.api_key_comfy_org, IO.Hidden.unique_id],
         is_api_node=True,
+        price_badge=_COMFY_CLOUD_PRICE_BADGE,
     )
 
 
@@ -997,11 +1023,13 @@ def _3d_schema(node_id: str, display_name: str, inputs: list[IO.Input], output: 
         node_id=node_id,
         display_name=display_name,
         category="partner/3d/Comfy Cloud",
-        description="Runs this 3D workflow on Comfy Cloud and returns the generated 3D file.",
+        description="Runs this 3D workflow on Comfy Cloud and returns the generated 3D file."
+        + _COMFY_CLOUD_RATE_DESCRIPTION,
         inputs=_with_input_sockets(inputs),
         outputs=[output],
         hidden=[IO.Hidden.auth_token_comfy_org, IO.Hidden.api_key_comfy_org, IO.Hidden.unique_id],
         is_api_node=True,
+        price_badge=_COMFY_CLOUD_PRICE_BADGE,
     )
 
 
