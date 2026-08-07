@@ -46,7 +46,7 @@ def test_workflow_submission_polling_and_download(monkeypatch, node, workflow, r
             task_id="task-1",
             status="completed",
             progress=100,
-            output_url="https://example.com/output",
+            output_url="/proxy/comfy-cloud/results/task-1/output",
         )
     )
     upload = AsyncMock(return_value="https://example.com/input.png")
@@ -111,6 +111,48 @@ def test_contract_omits_optional_status_fields():
     assert status.model_dump(exclude_none=True) == {"task_id": "task-1", "status": "queued"}
 
 
+@pytest.mark.parametrize("response_model", [ComfyCloudGenerateResponse, ComfyCloudStatusResponse])
+@pytest.mark.parametrize("task_id", ["", "   "])
+def test_contract_rejects_empty_task_ids(response_model, task_id):
+    values = {"task_id": task_id, "status": "queued"}
+    if response_model is ComfyCloudGenerateResponse:
+        values.update(polling_url="/poll", cancel_url="/cancel")
+
+    with pytest.raises(ValueError, match="task_id"):
+        response_model(**values)
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://example.com/output.png",
+        "http://127.0.0.1/output.png",
+        "//169.254.169.254/latest/meta-data",
+        "/unrelated/path/output.png",
+    ],
+)
+def test_cloud_workflows_reject_untrusted_output_urls(monkeypatch, url):
+    sync = AsyncMock(
+        return_value=ComfyCloudGenerateResponse(
+            task_id="task-1",
+            status="queued",
+            polling_url="/poll",
+            cancel_url="/cancel",
+        )
+    )
+    poll = AsyncMock(
+        return_value=ComfyCloudStatusResponse(task_id="task-1", status="completed", output_url=url)
+    )
+    download = AsyncMock()
+    monkeypatch.setattr(nodes_comfy_cloud, "sync_op", sync)
+    monkeypatch.setattr(nodes_comfy_cloud, "poll_op", poll)
+    monkeypatch.setattr(nodes_comfy_cloud, "download_url_to_image_tensor", download)
+
+    with pytest.raises(RuntimeError, match="invalid output URL"):
+        asyncio.run(nodes_comfy_cloud.ComfyCloudTextToImageNode.execute("prompt"))
+    download.assert_not_awaited()
+
+
 @pytest.mark.parametrize(
     "node",
     [
@@ -136,6 +178,21 @@ def test_legacy_nodes_strip_prompts_before_submission(monkeypatch):
     asyncio.run(nodes_comfy_cloud.ComfyCloudTextToImageNode.execute("  prompt  "))
 
     assert run.call_args.args[0].prompt == "prompt"
+
+
+def test_poc_nodes_strip_prompt_fields_before_submission(monkeypatch):
+    run = AsyncMock(return_value=("output",))
+    monkeypatch.setattr(nodes_comfy_cloud.ComfyCloudMageFlowImageNode, "_run", run)
+
+    asyncio.run(
+        nodes_comfy_cloud.ComfyCloudMageFlowImageNode.execute(
+            "  prompt  ", "  avoid this  ", "1:1", 0
+        )
+    )
+
+    inputs = run.call_args.args[0]
+    assert inputs.prompt == "prompt"
+    assert inputs.negative_prompt == "avoid this"
 
 
 def test_task_routes_ignore_response_urls_and_errors_hide_task_token(monkeypatch):
@@ -173,7 +230,7 @@ IMAGE_POC_NODES = [
         ["prompt", "aspect_ratio", "quality_mode", "seed"],
         {
             "prompt": "A geometric fox logo",
-            "aspect_ratio": "4:5",
+            "aspect_ratio": "21:9",
             "quality_mode": "fast",
             "seed": 11,
         },
@@ -223,7 +280,9 @@ def test_image_poc_node_schema_and_request_mapping(monkeypatch, node, workflow, 
     )
     poll = AsyncMock(
         return_value=ComfyCloudStatusResponse(
-            task_id="task-poc", status="completed", output_url="/results/task-poc/image.png"
+            task_id="task-poc",
+            status="completed",
+            output_url="/proxy/comfy-cloud/results/task-poc/image.png",
         )
     )
     upload = AsyncMock(return_value="/uploads/input.png")
@@ -255,7 +314,12 @@ def test_image_poc_node_schema_and_request_mapping(monkeypatch, node, workflow, 
     assert upload.await_count == int("image" in arguments)
     if "image" in arguments:
         assert upload.call_args.kwargs == {"total_pixels": None}
-    download.assert_awaited_once_with("/results/task-poc/image.png", cls=node)
+    download.assert_awaited_once_with(
+        "/proxy/comfy-cloud/results/task-poc/image.png",
+        timeout=30 * 60,
+        cls=node,
+        allow_redirects=False,
+    )
     assert output[0] == "image-output"
 
 
@@ -264,7 +328,7 @@ def test_image_poc_schema_defaults_ranges_and_enums():
         node.workflow: {input.id: input for input in node.define_schema().inputs}
         for node, _, _, _ in IMAGE_POC_NODES
     }
-    aspect_ratios = ["1:1", "4:5", "3:4", "2:3", "3:2", "4:3", "16:9", "9:16"]
+    aspect_ratios = ["1:1", "3:4", "2:3", "3:2", "4:3", "16:9", "9:16", "21:9"]
 
     for workflow in [
         "image.ideogram-4-design.v1",
@@ -316,6 +380,57 @@ def test_cloud_workflow_schemas_have_descriptions():
 
     for node in nodes:
         assert node.define_schema().description.strip(), node.__name__
+
+
+def test_all_linkable_widget_constraints_are_validated():
+    nodes = asyncio.run(nodes_comfy_cloud.ComfyCloudExtension().get_node_list())
+
+    for node in nodes:
+        for input_spec in node.define_schema().inputs:
+            if not isinstance(input_spec, nodes_comfy_cloud.IO.WidgetInput):
+                continue
+            io_type = input_spec.get_io_type()
+            if io_type == "COMBO":
+                invalid = "not-an-option"
+            elif io_type == "BOOLEAN":
+                invalid = "true"
+            elif io_type == "INT":
+                invalid = (input_spec.min - 1) if input_spec.min is not None else 1.5
+            elif io_type == "FLOAT":
+                invalid = float("nan")
+            elif io_type == "STRING" and nodes_comfy_cloud._TEXT_LIMITS.get(input_spec.id, (0,))[0]:
+                invalid = "   "
+            else:
+                continue
+            with pytest.raises((ValueError, Exception), match=input_spec.id):
+                nodes_comfy_cloud._validate_node_inputs(node, {input_spec.id: invalid})
+
+
+def test_linked_values_are_validated_before_upload(monkeypatch):
+    upload = AsyncMock()
+    monkeypatch.setattr(nodes_comfy_cloud, "upload_image_to_comfyapi", upload)
+    monkeypatch.setattr(nodes_comfy_cloud, "get_number_of_images", lambda image: 1)
+
+    with pytest.raises(ValueError, match="guidance"):
+        asyncio.run(
+            nodes_comfy_cloud.ComfyCloudFlux2ReferenceEditNode.execute(
+                object(), "instruction", float("nan"), "quality", 0
+            )
+        )
+    upload.assert_not_awaited()
+
+
+def test_upload_inputs_have_decoded_resource_limits():
+    oversized_image = torch.empty((1, 8193, 1, 3), device="meta")
+    oversized_audio = {
+        "waveform": torch.empty((1, 2, nodes_comfy_cloud._MAX_DECODED_AUDIO_BYTES // 8 + 1), device="meta"),
+        "sample_rate": 48000,
+    }
+
+    with pytest.raises(ValueError, match="32-megapixel"):
+        nodes_comfy_cloud._validate_image_upload(oversized_image)
+    with pytest.raises(ValueError, match="256 MiB"):
+        nodes_comfy_cloud._validate_audio_upload(oversized_audio)
 
 
 @pytest.mark.parametrize(
@@ -391,6 +506,23 @@ def test_scail_defaults_and_frame_count_fail_closed_before_upload(monkeypatch):
     video_upload.assert_not_awaited()
 
 
+def test_scail_rejects_missing_frame_count_metadata_before_upload(monkeypatch):
+    upload = AsyncMock()
+    video = Mock()
+    video.get_frame_count.return_value = None
+    monkeypatch.setattr(nodes_comfy_cloud, "upload_image_to_comfyapi", upload)
+    monkeypatch.setattr(nodes_comfy_cloud, "upload_video_to_comfyapi", upload)
+    monkeypatch.setattr(nodes_comfy_cloud, "get_number_of_images", lambda image: 1)
+
+    with pytest.raises(ValueError, match="Unable to determine video frame count"):
+        asyncio.run(
+            nodes_comfy_cloud.ComfyCloudSCAIL2CharacterReplacementNode.execute(
+                object(), video, "park", "human", "human", 1
+            )
+        )
+    upload.assert_not_awaited()
+
+
 @pytest.mark.parametrize("frame_count", [80, 158])
 def test_scail_rejects_out_of_range_frames_before_upload(monkeypatch, frame_count):
     upload = AsyncMock()
@@ -442,7 +574,7 @@ def test_in_memory_download_resets_retry_and_enforces_stream_limit(monkeypatch):
         def __init__(self, timeout):
             pass
 
-        async def get(self, url, headers):
+        async def get(self, url, headers, allow_redirects=True):
             return responses.pop(0)
 
         async def close(self):
@@ -505,7 +637,7 @@ def test_file_object_download_resets_retry_and_enforces_stream_limit(monkeypatch
         def __init__(self, timeout):
             pass
 
-        async def get(self, url, headers):
+        async def get(self, url, headers, allow_redirects=True):
             return responses.pop(0)
 
         async def close(self):
@@ -556,6 +688,7 @@ def test_download_cloud_audio_url_to_audio_input(monkeypatch):
     assert download_call.call_args.kwargs["timeout"] == 30
     assert download_call.call_args.kwargs["max_retries"] == 2
     assert download_call.call_args.kwargs["cls"] is node
+    assert download_call.call_args.kwargs["allow_redirects"] is True
     audio_decode.assert_called_once_with(downloaded)
 
 
@@ -607,7 +740,7 @@ def test_audio_poc_schema_defaults_ranges_and_enums():
 
 def test_audio_poc_request_mapping_and_named_result_decoding(monkeypatch):
     sync = AsyncMock(return_value=ComfyCloudGenerateResponse(task_id="task-audio", status="queued", polling_url="/tasks/task-audio", cancel_url="/tasks/task-audio/cancel"))
-    poll = AsyncMock(return_value=ComfyCloudStatusResponse(task_id="task-audio", status="completed", output_urls={"vocals": "/vocals.mp3", "instruments": "/instruments.mp3"}))
+    poll = AsyncMock(return_value=ComfyCloudStatusResponse(task_id="task-audio", status="completed", output_urls={"vocals": "/proxy/comfy-cloud/results/vocals.mp3", "instruments": "/proxy/comfy-cloud/results/instruments.mp3"}))
     upload = AsyncMock(return_value="/uploads/song.m4a")
     download = AsyncMock(side_effect=["vocals-audio", "instruments-audio"])
     monkeypatch.setattr(nodes_comfy_cloud, "sync_op", sync)
@@ -621,7 +754,12 @@ def test_audio_poc_request_mapping_and_named_result_decoding(monkeypatch):
     request = sync.call_args.kwargs["data"]
     assert request.workflow == "audio.melbandroformer-stem-separation.v1"
     assert request.inputs.model_dump(exclude_none=True) == {"assets": {"audio": {"type": "AUDIO", "url": "/uploads/song.m4a"}}}
-    assert [call.args[0] for call in download.await_args_list] == ["/vocals.mp3", "/instruments.mp3"]
+    assert [call.args[0] for call in download.await_args_list] == [
+        "/proxy/comfy-cloud/results/vocals.mp3",
+        "/proxy/comfy-cloud/results/instruments.mp3",
+    ]
+    assert all(call.kwargs["timeout"] == 30 * 60 for call in download.await_args_list)
+    assert all(call.kwargs["allow_redirects"] is False for call in download.await_args_list)
     assert poll.call_args.kwargs["cancel_endpoint"].path == "/proxy/comfy-cloud/workflow/tasks/task-audio/cancel"
     assert tuple(output) == ("vocals-audio", "instruments-audio")
 
@@ -723,7 +861,7 @@ def test_download_cloud_3d_url_to_file_3d(monkeypatch, file_format, expected_for
     assert output.get_bytes() == downloaded
     assert calls[0][0] == f"/proxy/comfy-cloud/results/task-1/model.{expected_format}"
     assert isinstance(calls[0][1], BytesIO)
-    assert calls[0][2] == {"timeout": 45, "max_retries": 3, "cls": node}
+    assert calls[0][2] == {"timeout": 45, "max_retries": 3, "cls": node, "allow_redirects": True}
 
 
 THREE_D_POC_NODES = [
@@ -807,7 +945,7 @@ def test_extension_preserves_all_23_poc_node_registrations():
 
 def test_3d_workflow_submission_polling_cancel_and_download(monkeypatch):
     sync = AsyncMock(return_value=ComfyCloudGenerateResponse(task_id="task-3d", status="queued", polling_url="/tasks/task-3d", cancel_url="/tasks/task-3d/cancel"))
-    poll = AsyncMock(return_value=ComfyCloudStatusResponse(task_id="task-3d", status="completed", output_url="/results/model.spz"))
+    poll = AsyncMock(return_value=ComfyCloudStatusResponse(task_id="task-3d", status="completed", output_url="/proxy/comfy-cloud/results/model.spz"))
     download = AsyncMock(return_value="spz-output")
     monkeypatch.setattr(nodes_comfy_cloud, "sync_op", sync)
     monkeypatch.setattr(nodes_comfy_cloud, "poll_op", poll)
@@ -821,5 +959,11 @@ def test_3d_workflow_submission_polling_cancel_and_download(monkeypatch):
     assert poll.call_args.args[1].path == "/proxy/comfy-cloud/workflow/tasks/task-3d"
     assert poll.call_args.kwargs["cancel_endpoint"].path == "/proxy/comfy-cloud/workflow/tasks/task-3d/cancel"
     assert poll.call_args.kwargs["cancel_endpoint"].method == "POST"
-    download.assert_awaited_once_with("/results/model.spz", "spz", cls=nodes_comfy_cloud.ComfyCloudTripoSplatImageToGaussianSplatNode)
+    download.assert_awaited_once_with(
+        "/proxy/comfy-cloud/results/model.spz",
+        "spz",
+        timeout=30 * 60,
+        cls=nodes_comfy_cloud.ComfyCloudTripoSplatImageToGaussianSplatNode,
+        allow_redirects=False,
+    )
     assert output[0] == "spz-output"

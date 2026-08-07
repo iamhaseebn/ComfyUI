@@ -39,6 +39,7 @@ async def download_url_to_bytesio(
     retry_delay: float = 1.0,
     retry_backoff: float = 2.0,
     cls: type[COMFY_IO.ComfyNode] = None,
+    allow_redirects: bool = True,
 ) -> None:
     """Stream-download a URL to `dest`.
 
@@ -101,7 +102,9 @@ async def download_url_to_bytesio(
 
             monitor_task = asyncio.create_task(_monitor())
 
-            req_task = asyncio.create_task(session.get(to_aiohttp_url(url), headers=headers))
+            req_task = asyncio.create_task(
+                session.get(to_aiohttp_url(url), headers=headers, allow_redirects=allow_redirects)
+            )
             done, pending = await asyncio.wait({req_task, monitor_task}, return_when=asyncio.FIRST_COMPLETED)
 
             if monitor_task in done and req_task in pending:
@@ -116,7 +119,7 @@ async def download_url_to_bytesio(
                 raise ProcessingInterrupted("Task cancelled") from None
 
             async with resp:
-                if resp.status >= 400:
+                if resp.status >= 300:
                     with contextlib.suppress(Exception):
                         try:
                             body = await resp.json()
@@ -236,10 +239,11 @@ async def download_url_to_image_tensor(
     *,
     timeout: float = None,
     cls: type[COMFY_IO.ComfyNode] = None,
+    allow_redirects: bool = True,
 ) -> torch.Tensor:
     """Downloads an image from a URL and returns a [B, H, W, C] tensor."""
     result = BytesIO()
-    await download_url_to_bytesio(url, result, timeout=timeout, cls=cls)
+    await download_url_to_bytesio(url, result, timeout=timeout, cls=cls, allow_redirects=allow_redirects)
     return bytesio_to_image_tensor(result)
 
 
@@ -249,10 +253,18 @@ async def download_url_to_video_output(
     timeout: float = None,
     max_retries: int = 5,
     cls: type[COMFY_IO.ComfyNode] = None,
+    allow_redirects: bool = True,
 ) -> InputImpl.VideoFromFile:
     """Downloads a video from a URL and returns a `VIDEO` output."""
     result = BytesIO()
-    await download_url_to_bytesio(video_url, result, timeout=timeout, max_retries=max_retries, cls=cls)
+    await download_url_to_bytesio(
+        video_url,
+        result,
+        timeout=timeout,
+        max_retries=max_retries,
+        cls=cls,
+        allow_redirects=allow_redirects,
+    )
     return InputImpl.VideoFromFile(result)
 
 
@@ -262,10 +274,18 @@ async def download_url_to_audio_input(
     timeout: float = None,
     max_retries: int = 5,
     cls: type[COMFY_IO.ComfyNode] = None,
+    allow_redirects: bool = True,
 ) -> Input.Audio:
     """Downloads audio from a URL and decodes it into a Comfy AUDIO input."""
     result = BytesIO()
-    await download_url_to_bytesio(audio_url, result, timeout=timeout, max_retries=max_retries, cls=cls)
+    await download_url_to_bytesio(
+        audio_url,
+        result,
+        timeout=timeout,
+        max_retries=max_retries,
+        cls=cls,
+        allow_redirects=allow_redirects,
+    )
     return audio_bytes_to_audio_input(result.getvalue())
 
 
@@ -298,6 +318,7 @@ async def download_url_to_file_3d(
     timeout: float | None = None,
     max_retries: int = 5,
     cls: type[COMFY_IO.ComfyNode] = None,
+    allow_redirects: bool = True,
 ) -> Types.File3D:
     """Downloads a 3D model file from a URL into memory as BytesIO.
 
@@ -312,6 +333,7 @@ async def download_url_to_file_3d(
         timeout=timeout,
         max_retries=max_retries,
         cls=cls,
+        allow_redirects=allow_redirects,
     )
 
     if task_id is not None:

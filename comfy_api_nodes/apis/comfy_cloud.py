@@ -1,6 +1,6 @@
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 ComfyCloudWorkflow = Literal[
@@ -91,16 +91,30 @@ class ComfyCloudGenerateRequest(BaseModel):
 
 
 class ComfyCloudGenerateResponse(BaseModel):
-    task_id: str = Field(...)
+    task_id: str = Field(..., min_length=1)
     status: str = Field(...)
     polling_url: str = Field(...)
     cancel_url: str = Field(...)
 
+    @field_validator("task_id")
+    @classmethod
+    def task_id_must_not_be_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("task_id must not be blank")
+        return value
+
 
 class ComfyCloudStatusResponse(BaseModel):
-    task_id: str = Field(...)
+    task_id: str = Field(..., min_length=1)
     status: str = Field(...)
-    progress: float | None = Field(None)
+    progress: float | None = Field(None, ge=0, le=100)
     output_url: str | None = Field(None)
     output_urls: dict[str, str] | None = Field(None)
     error: str | None = Field(None)
+
+    @field_validator("task_id")
+    @classmethod
+    def task_id_must_not_be_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("task_id must not be blank")
+        return value

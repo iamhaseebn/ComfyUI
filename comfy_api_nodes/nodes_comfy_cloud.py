@@ -1,7 +1,9 @@
 import math
 import re
 from typing import ClassVar
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
+
+import torch
 
 from typing_extensions import override
 
@@ -27,14 +29,31 @@ from comfy_api_nodes.util import (
     upload_image_to_comfyapi,
     upload_video_to_comfyapi,
     validate_string,
-    validate_video_frame_count,
 )
 
 
 _GENERATE_ENDPOINT = ApiEndpoint(path="/proxy/comfy-cloud/workflow/generate", method="POST")
+_OUTPUT_DOWNLOAD_TIMEOUT = 30 * 60
+_MAX_UPLOAD_IMAGE_PIXELS = 32_000_000
+_MAX_UPLOAD_IMAGE_DIMENSION = 8192
+_MAX_DECODED_AUDIO_BYTES = 256 * 1024 * 1024
+_TEXT_LIMITS = {
+    "prompt": (1, 4096),
+    "instruction": (1, 4096),
+    "negative_prompt": (0, 2048),
+    "scene_prompt": (1, 4096),
+    "driving_subject": (1, 256),
+    "reference_subject": (1, 256),
+    "style_prompt": (1, 4096),
+    "lyrics": (0, 20000),
+    "text": (1, 5000),
+    "script": (1, 10000),
+}
 
 
 def _task_endpoints(task_id: str) -> tuple[ApiEndpoint, ApiEndpoint]:
+    if not task_id.strip():
+        raise ValueError("Comfy Cloud returned an empty task ID.")
     task_path = f"/proxy/comfy-cloud/workflow/tasks/{quote(task_id, safe='')}"
     return ApiEndpoint(path=task_path), ApiEndpoint(path=f"{task_path}/cancel", method="POST")
 
@@ -44,6 +63,74 @@ def _with_input_sockets(inputs: list[IO.Input]) -> list[IO.Input]:
         if isinstance(input_spec, IO.WidgetInput):
             input_spec.socketless = False
     return inputs
+
+
+def _validated_output_url(url: str) -> str:
+    parsed = urlsplit(url)
+    if parsed.scheme or parsed.netloc or not parsed.path.startswith("/proxy/comfy-cloud/"):
+        raise RuntimeError("Comfy Cloud returned an invalid output URL.")
+    return url
+
+
+def _validate_image_upload(image: Input.Image) -> None:
+    if not isinstance(image, torch.Tensor):
+        return
+    if image.ndim not in (3, 4):
+        raise ValueError("Invalid input image shape.")
+    height, width = image.shape[-3:-1]
+    if max(height, width) > _MAX_UPLOAD_IMAGE_DIMENSION or height * width > _MAX_UPLOAD_IMAGE_PIXELS:
+        raise ValueError("Input image exceeds the 8192px or 32-megapixel Comfy Cloud limit.")
+
+
+def _validate_audio_upload(audio: Input.Audio) -> None:
+    waveform = audio["waveform"]
+    if waveform.ndim != 3 or waveform.shape[0] != 1 or waveform.shape[1] not in (1, 2):
+        raise ValueError("Audio must contain one mono or stereo waveform.")
+    if waveform.numel() * waveform.element_size() > _MAX_DECODED_AUDIO_BYTES:
+        raise ValueError("Decoded audio exceeds the 256 MiB Comfy Cloud limit.")
+
+
+def _validate_node_inputs(cls: type[IO.ComfyNode], values: dict) -> dict:
+    validated = dict(values)
+    for input_spec in cls.define_schema().inputs:
+        if not isinstance(input_spec, IO.WidgetInput) or input_spec.id not in values:
+            continue
+        value = values[input_spec.id]
+        io_type = input_spec.get_io_type()
+        if io_type == "STRING":
+            value = value.strip()
+            minimum, maximum = _TEXT_LIMITS.get(input_spec.id, (0, None))
+            validate_string(
+                value,
+                min_length=minimum,
+                max_length=maximum,
+                field_name=input_spec.id,
+            )
+            validated[input_spec.id] = value
+        elif io_type == "COMBO" and value not in input_spec.options:
+            raise ValueError(f"Invalid {input_spec.id}: {value!r}.")
+        elif io_type == "BOOLEAN" and not isinstance(value, bool):
+            raise ValueError(f"{input_spec.id} must be a boolean.")
+        elif io_type == "INT":
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError(f"{input_spec.id} must be an integer.")
+            if input_spec.min is not None and value < input_spec.min:
+                raise ValueError(f"{input_spec.id} must be at least {input_spec.min}.")
+            if input_spec.max is not None and value > input_spec.max:
+                raise ValueError(f"{input_spec.id} must be at most {input_spec.max}.")
+        elif io_type == "FLOAT":
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+                raise ValueError(f"{input_spec.id} must be a finite number.")
+            if input_spec.min is not None and value < input_spec.min:
+                raise ValueError(f"{input_spec.id} must be at least {input_spec.min}.")
+            if input_spec.max is not None and value > input_spec.max:
+                raise ValueError(f"{input_spec.id} must be at most {input_spec.max}.")
+            if input_spec.step:
+                origin = input_spec.min or 0
+                steps = (value - origin) / input_spec.step
+                if not math.isclose(steps, round(steps), abs_tol=1e-7):
+                    raise ValueError(f"{input_spec.id} must use increments of {input_spec.step}.")
+    return validated
 
 
 class _ComfyCloudWorkflowNode(IO.ComfyNode):
@@ -85,8 +172,7 @@ class _ComfyCloudWorkflowNode(IO.ComfyNode):
 
     @classmethod
     async def execute(cls, prompt: str, image: Input.Image | None = None) -> IO.NodeOutput:
-        prompt = prompt.strip()
-        validate_string(prompt, min_length=1, max_length=4096)
+        prompt = _validate_node_inputs(cls, locals())["prompt"]
 
         image_url = None
         if cls.requires_image:
@@ -98,6 +184,7 @@ class _ComfyCloudWorkflowNode(IO.ComfyNode):
     async def _upload_image(cls, image: Input.Image, total_pixels: int | None = 2048 * 2048) -> str:
         if get_number_of_images(image) != 1:
             raise ValueError("Exactly one input image is required.")
+        _validate_image_upload(image)
         return await upload_image_to_comfyapi(cls, image, total_pixels=total_pixels)
 
     @classmethod
@@ -124,9 +211,19 @@ class _ComfyCloudWorkflowNode(IO.ComfyNode):
             raise RuntimeError("Comfy Cloud task completed without an output URL.")
 
         if cls.returns_video:
-            output = await download_url_to_video_output(result.output_url, cls=cls)
+            output = await download_url_to_video_output(
+                _validated_output_url(result.output_url),
+                timeout=_OUTPUT_DOWNLOAD_TIMEOUT,
+                cls=cls,
+                allow_redirects=False,
+            )
         else:
-            output = await download_url_to_image_tensor(result.output_url, cls=cls)
+            output = await download_url_to_image_tensor(
+                _validated_output_url(result.output_url),
+                timeout=_OUTPUT_DOWNLOAD_TIMEOUT,
+                cls=cls,
+                allow_redirects=False,
+            )
         return IO.NodeOutput(output)
 
 
@@ -166,7 +263,7 @@ class ComfyCloudImageEditNode(_ComfyCloudWorkflowNode):
     returns_video = False
 
 
-_ASPECT_RATIOS = ["1:1", "4:5", "3:4", "2:3", "3:2", "4:3", "16:9", "9:16"]
+_ASPECT_RATIOS = ["1:1", "3:4", "2:3", "3:2", "4:3", "16:9", "9:16", "21:9"]
 _UINT64_MAX = 0xFFFFFFFFFFFFFFFF
 
 
@@ -227,7 +324,8 @@ class ComfyCloudIdeogram4DesignNode(_ComfyCloudWorkflowNode):
     async def execute(
         cls, prompt: str, aspect_ratio: str = "1:1", quality_mode: str = "balanced", seed: int = 0
     ) -> IO.NodeOutput:
-        validate_string(prompt, min_length=1, max_length=4096)
+        values = _validate_node_inputs(cls, locals())
+        prompt = values["prompt"]
         return await cls._run(
             ComfyCloudWorkflowInputs(
                 prompt=prompt, aspect_ratio=aspect_ratio, quality_mode=quality_mode, seed=seed
@@ -261,7 +359,8 @@ class ComfyCloudKrea2CreativeImageNode(_ComfyCloudWorkflowNode):
     async def execute(
         cls, prompt: str, prompt_enhance: bool = True, aspect_ratio: str = "1:1", seed: int = 0
     ) -> IO.NodeOutput:
-        validate_string(prompt, min_length=1, max_length=4096)
+        values = _validate_node_inputs(cls, locals())
+        prompt = values["prompt"]
         return await cls._run(
             ComfyCloudWorkflowInputs(
                 prompt=prompt, prompt_enhance=prompt_enhance, aspect_ratio=aspect_ratio, seed=seed
@@ -295,8 +394,9 @@ class ComfyCloudMageFlowImageNode(_ComfyCloudWorkflowNode):
     async def execute(
         cls, prompt: str, negative_prompt: str = "", aspect_ratio: str = "1:1", seed: int = 0
     ) -> IO.NodeOutput:
-        validate_string(prompt, min_length=1, max_length=4096)
-        validate_string(negative_prompt, min_length=0, max_length=2048, field_name="negative_prompt")
+        values = _validate_node_inputs(cls, locals())
+        prompt = values["prompt"]
+        negative_prompt = values["negative_prompt"]
         return await cls._run(
             ComfyCloudWorkflowInputs(
                 prompt=prompt, negative_prompt=negative_prompt, aspect_ratio=aspect_ratio, seed=seed
@@ -336,7 +436,8 @@ class ComfyCloudFlux2ReferenceEditNode(_ComfyCloudWorkflowNode):
         quality_mode: str = "quality",
         seed: int = 0,
     ) -> IO.NodeOutput:
-        validate_string(instruction, min_length=1, max_length=4096, field_name="instruction")
+        values = _validate_node_inputs(cls, locals())
+        instruction = values["instruction"]
         return await cls._run(
             ComfyCloudWorkflowInputs(
                 assets={
@@ -382,7 +483,8 @@ class ComfyCloudQwenImageEdit2511Node(_ComfyCloudWorkflowNode):
         quality_mode: str = "quality",
         seed: int = 0,
     ) -> IO.NodeOutput:
-        validate_string(instruction, min_length=1, max_length=4096, field_name="instruction")
+        values = _validate_node_inputs(cls, locals())
+        instruction = values["instruction"]
         return await cls._run(
             ComfyCloudWorkflowInputs(
                 assets={
@@ -416,6 +518,7 @@ class ComfyCloudSeedVR2ImageUpscaleNode(_ComfyCloudWorkflowNode):
     @classmethod
     # pylint: disable=arguments-renamed
     async def execute(cls, image: Input.Image, scale: str = "4x") -> IO.NodeOutput:
+        _validate_node_inputs(cls, locals())
         return await cls._run(
             ComfyCloudWorkflowInputs(
                 assets={
@@ -441,7 +544,14 @@ async def _run_video_workflow(cls: type[IO.ComfyNode], workflow: ComfyCloudWorkf
     )
     if not result.output_url:
         raise RuntimeError("Comfy Cloud task completed without an output URL.")
-    return IO.NodeOutput(await download_url_to_video_output(result.output_url, cls=cls))
+    return IO.NodeOutput(
+        await download_url_to_video_output(
+            _validated_output_url(result.output_url),
+            timeout=_OUTPUT_DOWNLOAD_TIMEOUT,
+            cls=cls,
+            allow_redirects=False,
+        )
+    )
 
 
 def _video_schema(node_id: str, display_name: str, inputs: list[IO.Input]) -> IO.Schema:
@@ -477,7 +587,8 @@ class ComfyCloudMiniMaxH3TextSoundNode(IO.ComfyNode):
 
     @classmethod
     async def execute(cls, prompt: str, aspect_ratio: str, duration_seconds: float, seed: int) -> IO.NodeOutput:
-        validate_string(prompt, min_length=1, max_length=4096)
+        values = _validate_node_inputs(cls, locals())
+        prompt = values["prompt"]
         return await _run_video_workflow(cls, "video.minimax-h3-text-sound.v1", ComfyCloudWorkflowInputs(prompt=prompt, aspect_ratio=aspect_ratio, duration_seconds=duration_seconds, seed=seed))
 
 
@@ -498,9 +609,11 @@ class ComfyCloudMiniMaxH3ImageSoundNode(IO.ComfyNode):
 
     @classmethod
     async def execute(cls, image: Input.Image, prompt: str, aspect_ratio: str, duration_seconds: float, seed: int) -> IO.NodeOutput:
-        validate_string(prompt, min_length=1, max_length=4096)
+        values = _validate_node_inputs(cls, locals())
+        prompt = values["prompt"]
         if get_number_of_images(image) != 1:
             raise ValueError("Exactly one input image is required.")
+        _validate_image_upload(image)
         image_url = await upload_image_to_comfyapi(cls, image)
         return await _run_video_workflow(cls, "video.minimax-h3-image-sound.v1", ComfyCloudWorkflowInputs(prompt=prompt, image_url=image_url, aspect_ratio=aspect_ratio, duration_seconds=duration_seconds, seed=seed))
 
@@ -521,9 +634,12 @@ class ComfyCloudLTX23ImageAudioPerformanceNode(IO.ComfyNode):
 
     @classmethod
     async def execute(cls, image: Input.Image, audio: Input.Audio, prompt: str, enhance_prompt: bool, duration_seconds: float, seed: int) -> IO.NodeOutput:
-        validate_string(prompt, min_length=1, max_length=4096)
+        values = _validate_node_inputs(cls, locals())
+        prompt = values["prompt"]
         if get_number_of_images(image) != 1:
             raise ValueError("Exactly one input image is required.")
+        _validate_image_upload(image)
+        _validate_audio_upload(audio)
         audio_duration = _audio_duration(audio)
         if duration_seconds - min(1 / float(audio["sample_rate"]), 1e-3) > audio_duration:
             raise ValueError(f"Duration ({duration_seconds:g}s) exceeds input audio duration ({audio_duration:.2f}s).")
@@ -543,9 +659,12 @@ class ComfyCloudLTX23FirstLastFrameNode(IO.ComfyNode):
 
     @classmethod
     async def execute(cls, first_frame: Input.Image, last_frame: Input.Image, prompt: str, duration_seconds: int, seed: int) -> IO.NodeOutput:
-        validate_string(prompt, min_length=1, max_length=4096)
+        values = _validate_node_inputs(cls, locals())
+        prompt = values["prompt"]
         if get_number_of_images(first_frame) != 1 or get_number_of_images(last_frame) != 1:
             raise ValueError("Exactly one first frame and one last frame are required.")
+        _validate_image_upload(first_frame)
+        _validate_image_upload(last_frame)
         first_url = await upload_image_to_comfyapi(cls, first_frame, wait_label="Uploading first frame")
         last_url = await upload_image_to_comfyapi(cls, last_frame, wait_label="Uploading last frame")
         return await _run_video_workflow(cls, "video.ltx-2-3-first-last-frame.v1", ComfyCloudWorkflowInputs(prompt=prompt, first_frame_url=first_url, last_frame_url=last_url, duration_seconds=duration_seconds, seed=seed))
@@ -562,10 +681,13 @@ class ComfyCloudWan22FirstLastFrameNode(IO.ComfyNode):
 
     @classmethod
     async def execute(cls, first_frame: Input.Image, last_frame: Input.Image, prompt: str, negative_prompt: str, duration_seconds: int, seed: int) -> IO.NodeOutput:
-        validate_string(prompt, min_length=1, max_length=4096)
-        validate_string(negative_prompt, min_length=0, max_length=2048)
+        values = _validate_node_inputs(cls, locals())
+        prompt = values["prompt"]
+        negative_prompt = values["negative_prompt"]
         if get_number_of_images(first_frame) != 1 or get_number_of_images(last_frame) != 1:
             raise ValueError("Exactly one first frame and one last frame are required.")
+        _validate_image_upload(first_frame)
+        _validate_image_upload(last_frame)
         first_url = await upload_image_to_comfyapi(cls, first_frame, wait_label="Uploading first frame")
         last_url = await upload_image_to_comfyapi(cls, last_frame, wait_label="Uploading last frame")
         return await _run_video_workflow(cls, "video.wan-2-2-14b-first-last-frame.v1", ComfyCloudWorkflowInputs(prompt=prompt, negative_prompt=negative_prompt, first_frame_url=first_url, last_frame_url=last_url, duration_seconds=duration_seconds, seed=seed))
@@ -582,12 +704,21 @@ class ComfyCloudSCAIL2CharacterReplacementNode(IO.ComfyNode):
 
     @classmethod
     async def execute(cls, reference_character: Input.Image, driving_video: Input.Video, scene_prompt: str, driving_subject: str, reference_subject: str, seed: int) -> IO.NodeOutput:
-        validate_string(scene_prompt, min_length=1, max_length=4096, field_name="scene_prompt")
-        validate_string(driving_subject, min_length=1, max_length=256, field_name="driving_subject")
-        validate_string(reference_subject, min_length=1, max_length=256, field_name="reference_subject")
+        values = _validate_node_inputs(cls, locals())
+        scene_prompt = values["scene_prompt"]
+        driving_subject = values["driving_subject"]
+        reference_subject = values["reference_subject"]
         if get_number_of_images(reference_character) != 1:
             raise ValueError("Exactly one reference character image is required.")
-        validate_video_frame_count(driving_video, min_frame_count=81, max_frame_count=157, fail_on_error=True)
+        _validate_image_upload(reference_character)
+        try:
+            frame_count = driving_video.get_frame_count()
+        except Exception as error:
+            raise ValueError("Unable to determine video frame count.") from error
+        if isinstance(frame_count, bool) or not isinstance(frame_count, int):
+            raise ValueError("Unable to determine video frame count.")
+        if not 81 <= frame_count <= 157:
+            raise ValueError(f"Video frame count must be between 81 and 157, got {frame_count}.")
         image_url = await upload_image_to_comfyapi(cls, reference_character)
         video_url = await upload_video_to_comfyapi(cls, driving_video)
         return await _run_video_workflow(cls, "video.scail-2-character-replacement.v1", ComfyCloudWorkflowInputs(scene_prompt=scene_prompt, driving_subject=driving_subject, reference_subject=reference_subject, reference_character_url=image_url, driving_video_url=video_url, seed=seed))
@@ -654,6 +785,7 @@ def _normalize_dialogue(script: str) -> str:
 
 
 async def _audio_asset(cls: type[IO.ComfyNode], name: str, audio: Input.Audio) -> dict[str, ComfyCloudAssetInput]:
+    _validate_audio_upload(audio)
     return {name: ComfyCloudAssetInput(type="AUDIO", url=await upload_audio_to_comfyapi(cls, audio))}
 
 
@@ -671,11 +803,26 @@ async def _run_audio_workflow(cls: type[IO.ComfyNode], workflow: ComfyCloudWorkf
     if output_names:
         if not result.output_urls or any(not result.output_urls.get(name) for name in output_names):
             raise RuntimeError("Comfy Cloud task completed without all named output URLs.")
-        outputs = [await download_url_to_audio_input(result.output_urls[name], cls=cls) for name in output_names]
+        outputs = [
+            await download_url_to_audio_input(
+                _validated_output_url(result.output_urls[name]),
+                timeout=_OUTPUT_DOWNLOAD_TIMEOUT,
+                cls=cls,
+                allow_redirects=False,
+            )
+            for name in output_names
+        ]
         return IO.NodeOutput(*outputs)
     if not result.output_url:
         raise RuntimeError("Comfy Cloud task completed without an output URL.")
-    return IO.NodeOutput(await download_url_to_audio_input(result.output_url, cls=cls))
+    return IO.NodeOutput(
+        await download_url_to_audio_input(
+            _validated_output_url(result.output_url),
+            timeout=_OUTPUT_DOWNLOAD_TIMEOUT,
+            cls=cls,
+            allow_redirects=False,
+        )
+    )
 
 
 class ComfyCloudACEStep15XLTurboNode(IO.ComfyNode):
@@ -698,8 +845,9 @@ class ComfyCloudACEStep15XLTurboNode(IO.ComfyNode):
 
     @classmethod
     async def execute(cls, style_prompt: str, lyrics: str, duration_seconds: float, seed: int, bpm: int, time_signature: str, language: str, key: str) -> IO.NodeOutput:
-        validate_string(style_prompt, min_length=1, max_length=4096, field_name="style_prompt")
-        validate_string(lyrics, min_length=0, max_length=20000, field_name="lyrics")
+        values = _validate_node_inputs(cls, locals())
+        style_prompt = values["style_prompt"]
+        lyrics = values["lyrics"]
         return await _run_audio_workflow(cls, "audio.ace-step-1-5-xl-turbo.v1", ComfyCloudWorkflowInputs(style_prompt=style_prompt, lyrics=lyrics, duration_seconds=duration_seconds, seed=seed, bpm=bpm, time_signature=time_signature, language=language, key=key))
 
 
@@ -720,7 +868,8 @@ class ComfyCloudStableAudio3MediumNode(IO.ComfyNode):
 
     @classmethod
     async def execute(cls, prompt: str, duration_seconds: float, seed: int, expand_prompt: bool, category: str) -> IO.NodeOutput:
-        validate_string(prompt, min_length=1, max_length=4096)
+        values = _validate_node_inputs(cls, locals())
+        prompt = values["prompt"]
         return await _run_audio_workflow(cls, "audio.stable-audio-3-medium.v1", ComfyCloudWorkflowInputs(prompt=prompt, duration_seconds=duration_seconds, seed=seed, expand_prompt=expand_prompt, category=category))
 
 
@@ -742,7 +891,8 @@ class ComfyCloudChatterboxMultilingualVoiceCloneNode(IO.ComfyNode):
 
     @classmethod
     async def execute(cls, text: str, voice_reference: Input.Audio, language: str, exaggeration: float, cfg_weight: float, temperature: float, seed: int) -> IO.NodeOutput:
-        validate_string(text, min_length=1, max_length=5000, field_name="text")
+        values = _validate_node_inputs(cls, locals())
+        text = values["text"]
         _validate_audio_duration("Voice reference", voice_reference, 1, 30)
         return await _run_audio_workflow(cls, "audio.chatterbox-multilingual-voice-clone.v1", ComfyCloudWorkflowInputs(text=text, assets=await _audio_asset(cls, "voice_reference", voice_reference), language=language, exaggeration=exaggeration, cfg_weight=cfg_weight, temperature=temperature, seed=seed))
 
@@ -764,9 +914,12 @@ class ComfyCloudChatterboxDialogueNode(IO.ComfyNode):
 
     @classmethod
     async def execute(cls, script: str, speaker_a_reference: Input.Audio, speaker_b_reference: Input.Audio, exaggeration: float, cfg_weight: float, temperature: float, seed: int) -> IO.NodeOutput:
-        validate_string(script, min_length=1, max_length=10000, field_name="script")
+        values = _validate_node_inputs(cls, locals())
+        script = values["script"]
         script = _normalize_dialogue(script)
         validate_string(script, min_length=1, max_length=10000, field_name="script")
+        _validate_audio_upload(speaker_a_reference)
+        _validate_audio_upload(speaker_b_reference)
         _validate_audio_duration("Speaker A reference", speaker_a_reference, 1, 30)
         _validate_audio_duration("Speaker B reference", speaker_b_reference, 1, 30)
         assets = {
@@ -787,6 +940,9 @@ class ComfyCloudChatterboxVoiceConversionNode(IO.ComfyNode):
 
     @classmethod
     async def execute(cls, source_audio: Input.Audio, target_voice_reference: Input.Audio, seed: int) -> IO.NodeOutput:
+        _validate_node_inputs(cls, locals())
+        _validate_audio_upload(source_audio)
+        _validate_audio_upload(target_voice_reference)
         _validate_audio_duration("Source audio", source_audio, 0.5, 300)
         _validate_audio_duration("Target voice reference", target_voice_reference, 1, 30)
         assets = {
@@ -825,7 +981,15 @@ async def _run_3d_workflow(cls: type[IO.ComfyNode], workflow: ComfyCloudWorkflow
     )
     if not result.output_url:
         raise RuntimeError("Comfy Cloud task completed without an output URL.")
-    return IO.NodeOutput(await download_url_to_file_3d(result.output_url, file_format, cls=cls))
+    return IO.NodeOutput(
+        await download_url_to_file_3d(
+            _validated_output_url(result.output_url),
+            file_format,
+            timeout=_OUTPUT_DOWNLOAD_TIMEOUT,
+            cls=cls,
+            allow_redirects=False,
+        )
+    )
 
 
 def _3d_schema(node_id: str, display_name: str, inputs: list[IO.Input], output: IO.Output) -> IO.Schema:
@@ -844,6 +1008,7 @@ def _3d_schema(node_id: str, display_name: str, inputs: list[IO.Input], output: 
 async def _image_asset(cls: type[IO.ComfyNode], name: str, image: Input.Image, wait_label: str | None = None) -> dict[str, ComfyCloudAssetInput]:
     if get_number_of_images(image) != 1:
         raise ValueError(f"Exactly one {name.replace('_', ' ')} is required.")
+    _validate_image_upload(image)
     kwargs = {"total_pixels": None}
     if wait_label is not None:
         kwargs["wait_label"] = wait_label
@@ -867,6 +1032,7 @@ class ComfyCloudTripoSplatImageToGaussianSplatNode(IO.ComfyNode):
 
     @classmethod
     async def execute(cls, image: Input.Image, remove_background: bool, seed: int, gaussian_count: int) -> IO.NodeOutput:
+        _validate_node_inputs(cls, locals())
         return await _run_3d_workflow(cls, "3d.triposplat-image-to-gaussian-splat.v1", ComfyCloudWorkflowInputs(assets=await _image_asset(cls, "image", image), remove_background=remove_background, seed=seed, gaussian_count=gaussian_count), "spz")
 
 
@@ -882,6 +1048,7 @@ class ComfyCloudHunyuan3D21ImageTo3DNode(IO.ComfyNode):
 
     @classmethod
     async def execute(cls, image: Input.Image, seed: int) -> IO.NodeOutput:
+        _validate_node_inputs(cls, locals())
         return await _run_3d_workflow(cls, "3d.hunyuan3d-2-1-image-to-3d.v1", ComfyCloudWorkflowInputs(assets=await _image_asset(cls, "image", image), seed=seed), "glb")
 
 
@@ -897,6 +1064,7 @@ class ComfyCloudHunyuan3DMultiViewTo3DNode(IO.ComfyNode):
 
     @classmethod
     async def execute(cls, front_image: Input.Image, back_image: Input.Image, seed: int) -> IO.NodeOutput:
+        _validate_node_inputs(cls, locals())
         if get_number_of_images(front_image) != 1 or get_number_of_images(back_image) != 1:
             raise ValueError("Exactly one front image and one back image are required.")
         assets = await _image_asset(cls, "front_image", front_image, "Uploading front image")
@@ -923,6 +1091,7 @@ class ComfyCloudMoGe2PhotoToTexturedMeshNode(IO.ComfyNode):
 
     @classmethod
     async def execute(cls, image: Input.Image, fov_degrees: float, detail: int, mesh_decimation: int, gap_threshold: float, texture: bool) -> IO.NodeOutput:
+        _validate_node_inputs(cls, locals())
         inputs = ComfyCloudWorkflowInputs(assets=await _image_asset(cls, "image", image), fov_degrees=fov_degrees, detail=detail, mesh_decimation=mesh_decimation, gap_threshold=gap_threshold, texture=texture)
         return await _run_3d_workflow(cls, "3d.moge-2-photo-to-textured-mesh.v1", inputs, "glb")
 
@@ -947,6 +1116,7 @@ class ComfyCloudMoGe2PanoramaTo3DSceneNode(IO.ComfyNode):
 
     @classmethod
     async def execute(cls, panorama: Input.Image, detail: int, split_resolution: int, merge_resolution: int, mesh_decimation: int, gap_threshold: float, texture: bool) -> IO.NodeOutput:
+        _validate_node_inputs(cls, locals())
         inputs = ComfyCloudWorkflowInputs(assets=await _image_asset(cls, "panorama", panorama), detail=detail, split_resolution=split_resolution, merge_resolution=merge_resolution, mesh_decimation=mesh_decimation, gap_threshold=gap_threshold, texture=texture)
         return await _run_3d_workflow(cls, "3d.moge-2-panorama-to-3d-scene.v1", inputs, "glb")
 
